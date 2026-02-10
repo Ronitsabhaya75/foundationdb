@@ -177,8 +177,6 @@ if(WIN32)
   # Use CONFIG mode to prefer Boost's BoostConfig.cmake over deprecated FindBoost module
   # This is required for CMake 3.30+ compatibility (policy CMP0167)
   find_package(Boost 1.86.0 EXACT QUIET COMPONENTS filesystem iostreams serialization system program_options url CONFIG PATHS ${BOOST_HINT_PATHS})
-  # I think depending on the cmake version this will cause weird warnings
-  find_package(Boost 1.86 COMPONENTS filesystem iostreams serialization system program_options url)
   add_library(boost_target INTERFACE)
   target_link_libraries(boost_target INTERFACE Boost::boost Boost::filesystem Boost::iostreams Boost::serialization Boost::system Boost::url)
   
