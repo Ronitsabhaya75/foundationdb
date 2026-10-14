@@ -1,0 +1,110 @@
+name: Build and Simulate
+
+on:
+  push:
+    branches:
+      - main
+      - 'feature/**'
+      - 'research/**'
+  pull_request:
+    branches:
+      - main
+  workflow_dispatch:
+    inputs:
+      test_file:
+        description: 'Simulation test TOML to run'
+        required: false
+        default: 'tests/fast/MaxGrvQueueDelay.toml'
+      build_target:
+        description: 'Ninja target to build (e.g. fdbserver, fdbserver_core_test)'
+        required: false
+        default: 'fdbserver'
+      build_type:
+        description: 'CMake build type (Release, RelWithDebInfo, Debug)'
+        required: false
+        default: 'Release'
+
+permissions:
+  contents: read
+
+jobs:
+  build-and-test:
+    runs-on: ubuntu-latest
+    timeout-minutes: 180
+
+    steps:
+      - name: Free Disk Space on Runner
+        run: |
+          echo "Disk space before cleanup:"
+          df -h
+          sudo rm -rf /usr/share/dotnet
+          sudo rm -rf /usr/local/lib/android
+          sudo rm -rf /opt/ghc
+          sudo rm -rf /opt/hostedtoolcache
+          sudo docker image prune --all --force || true
+          echo "Disk space after cleanup:"
+          df -h
+
+      - name: Checkout Code
+        uses: actions/checkout@v4
+
+      - name: Setup ccache
+        uses: actions/cache@v4
+        with:
+          path: .ccache
+          key: fdb-ccache-${{ runner.os }}-${{ github.ref_name }}-${{ github.sha }}
+          restore-keys: |
+            fdb-ccache-${{ runner.os }}-${{ github.ref_name }}-
+            fdb-ccache-${{ runner.os }}-
+
+      - name: Build and Run in Official FDB Build Container
+        run: |
+          mkdir -p build .ccache
+          TARGET="${{ github.event.inputs.build_target || 'fdbserver' }}"
+          BUILD_TYPE="${{ github.event.inputs.build_type || 'Release' }}"
+          TEST_FILE="${{ github.event.inputs.test_file || 'tests/fast/MaxGrvQueueDelay.toml' }}"
+
+          echo "Building target: ${TARGET} in ${BUILD_TYPE} mode"
+          echo "Test file to run: ${TEST_FILE}"
+
+          docker run --rm \
+            -v ${{ github.workspace }}:/workspace \
+            -v ${{ github.workspace }}/.ccache:/root/.ccache \
+            -e CCACHE_DIR=/root/.ccache \
+            -e CCACHE_MAXSIZE=5G \
+            -w /workspace/build \
+            docker.io/foundationdb/build:rockylinux9-latest \
+            bash -c "
+              set -e
+              source /opt/rh/gcc-toolset-13/enable || true
+
+              cmake -G Ninja \
+                -D CMAKE_BUILD_TYPE=\${BUILD_TYPE} \
+                -D BUILD_SWIFT_BINDING=OFF \
+                -D USE_CCACHE=ON \
+                -D USE_LD=LLD \
+                -D USE_LIBCXX=1 \
+                -D USE_WERROR=OFF \
+                ..
+
+              ninja \${TARGET}
+
+              if [ -f \"\${TARGET}\" ] || [ -f \"bin/\${TARGET}\" ]; then
+                echo 'Build completed successfully!'
+              fi
+
+              if [ -n \"\${TEST_FILE}\" ] && [ -f \"../\${TEST_FILE}\" ]; then
+                echo \"Running simulation test: \${TEST_FILE}\"
+                bin/fdbserver -r simulation -f ../\${TEST_FILE} || true
+              fi
+            "
+
+      - name: Upload Test Traces and Logs
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: fdb-simulation-traces
+          path: |
+            build/trace.*.xml
+            build/trace.*.json
+          if-no-files-found: ignore

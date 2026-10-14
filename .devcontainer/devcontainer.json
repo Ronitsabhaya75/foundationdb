@@ -9,9 +9,6 @@
   "securityOpt": [
     "seccomp=unconfined"
   ],
-  "hostRequirements": {
-    "storage": "60gb"
-  },
   "containerEnv": {
     "CC": "clang",
     "CXX": "clang++",
