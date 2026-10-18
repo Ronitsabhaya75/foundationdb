@@ -9,7 +9,7 @@
   "securityOpt": [
     "seccomp=unconfined"
   ],
-    "hostRequirements": {
+  "hostRequirements": {
     "storage": "60gb"
   },
   "containerEnv": {
