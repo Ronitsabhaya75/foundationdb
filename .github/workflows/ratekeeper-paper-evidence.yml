@@ -3,7 +3,7 @@ name: Ratekeeper Paper Evidence
 on:
   push:
     branches:
-      - research/ratekeeper-fdb
+      - main
     paths:
       - ".github/workflows/ratekeeper-paper-evidence.yml"
   workflow_dispatch:
