@@ -4,71 +4,89 @@ on:
   push:
     branches:
       - main
-      - 'feature/**'
-      - 'research/**'
   pull_request:
     branches:
       - main
   workflow_dispatch:
     inputs:
       test_file:
-        description: 'Simulation test TOML to run'
+        description: "Simulation test TOML to run"
         required: false
-        default: 'tests/fast/MaxGrvQueueDelay.toml'
-      build_target:
-        description: 'Ninja target to build (e.g. fdbserver, fdbserver_core_test)'
-        required: false
-        default: 'fdbserver'
+        default: "tests/fast/MaxGrvQueueDelay.toml"
       build_type:
-        description: 'CMake build type (Release, RelWithDebInfo, Debug)'
+        description: "CMake build type"
         required: false
-        default: 'Release'
+        default: "Release"
+        type: choice
+        options:
+          - Release
+          - RelWithDebInfo
+          - Debug
 
 permissions:
   contents: read
 
 jobs:
   build-and-test:
+    name: Build fdbserver and run simulation
     runs-on: ubuntu-latest
+    timeout-minutes: 300
+
+    env:
+      BUILD_TYPE: ${{ inputs.build_type || 'Release' }}
+      TEST_FILE: ${{ inputs.test_file || 'tests/fast/MaxGrvQueueDelay.toml' }}
 
     steps:
-      - name: Free Disk Space on Runner
+      - name: Free disk space
         run: |
+          set -euo pipefail
+
           echo "Disk space before cleanup:"
           df -h
+
           sudo rm -rf /usr/share/dotnet
           sudo rm -rf /usr/local/lib/android
           sudo rm -rf /opt/ghc
           sudo rm -rf /opt/hostedtoolcache
+
           sudo docker image prune --all --force || true
+
           echo "Disk space after cleanup:"
           df -h
 
-      - name: Checkout Code
+      - name: Checkout source
         uses: actions/checkout@v4
 
-      - name: Setup ccache
-        uses: actions/cache@v4
+      - name: Validate simulation file
+        run: |
+          set -euo pipefail
+          test -f "$TEST_FILE"
+          echo "Simulation file: $TEST_FILE"
+
+      - name: Create build and cache directories
+        run: |
+          mkdir -p build .ccache
+
+      # A unique key is used for every run because GitHub cache entries
+      # are immutable. restore-keys retrieves the newest previous cache.
+      - name: Restore ccache
+        id: ccache-restore
+        uses: actions/cache/restore@v4
         with:
           path: .ccache
-          key: fdb-ccache-${{ runner.os }}-${{ github.ref_name }}-${{ github.sha }}
+          key: fdb-ccache-${{ runner.os }}-${{ env.BUILD_TYPE }}-${{ github.run_id }}-${{ github.run_attempt }}
           restore-keys: |
-            fdb-ccache-${{ runner.os }}-${{ github.ref_name }}-
+            fdb-ccache-${{ runner.os }}-${{ env.BUILD_TYPE }}-
             fdb-ccache-${{ runner.os }}-
 
       - name: Compile fdbserver from source and run simulation
-        env:
-          BUILD_TYPE: ${{ inputs.build_type || 'Release' }}
-          TEST_FILE: ${{ inputs.test_file || 'tests/fast/MaxGrvQueueDelay.toml' }}
         run: |
           set -euo pipefail
 
-          test -f "$TEST_FILE"
-          mkdir -p build .ccache
-
-          echo "Compiling fdbserver from commit $GITHUB_SHA"
+          echo "Compiling fdbserver from commit: $GITHUB_SHA"
           echo "Build type: $BUILD_TYPE"
-          echo "Simulation: $TEST_FILE"
+          echo "Simulation file: $TEST_FILE"
+          echo "ccache restored: ${{ steps.ccache-restore.outputs.cache-hit }}"
 
           docker run --rm \
             -v "${{ github.workspace }}:/workspace" \
@@ -76,13 +94,17 @@ jobs:
             -e BUILD_TYPE="$BUILD_TYPE" \
             -e TEST_FILE="$TEST_FILE" \
             -e CCACHE_DIR=/root/.ccache \
-            -e CCACHE_MAXSIZE=5G \
+            -e CCACHE_MAXSIZE=2G \
+            -e CCACHE_BASEDIR=/workspace \
+            -e CCACHE_NOHASHDIR=true \
             -e GOFLAGS=-buildvcs=false \
             -w /workspace/build \
             docker.io/foundationdb/build:rockylinux9-latest \
             bash -euo pipefail -c '
               source /opt/rh/gcc-toolset-13/enable || true
               git config --global --add safe.directory /workspace
+
+              echo "Configuring FoundationDB..."
 
               cmake -G Ninja \
                 -D CMAKE_BUILD_TYPE="$BUILD_TYPE" \
@@ -93,18 +115,23 @@ jobs:
                 -D USE_LD=LLD \
                 -D USE_LIBCXX=1 \
                 -D USE_WERROR=OFF \
-              ..
+                ..
 
-              # Build fdbserver entirely from the checked-out source.
-              ninja fdbserver
+              echo "Building fdbserver with two parallel compiler jobs..."
+
+              # Limiting Ninja to two jobs prevents exit code 137/OOM.
+              ninja -j2 fdbserver
 
               test -x bin/fdbserver
 
               echo "Compiled binary:"
               bin/fdbserver --version
+
+              echo "ccache statistics:"
               ccache --show-stats || true
 
               echo "Running simulation: $TEST_FILE"
+
               bin/fdbserver \
                 -r simulation \
                 -f "../$TEST_FILE" \
@@ -112,12 +139,36 @@ jobs:
                 --buggify off
             '
 
-      - name: Upload Test Traces and Logs
+      # Docker creates some ccache files as root. Correct ownership before
+      # the GitHub cache action attempts to archive them.
+      - name: Prepare ccache for upload
+        if: always()
+        run: |
+          sudo chown -R "$(id -u):$(id -g)" .ccache || true
+          du -sh .ccache || true
+
+      # The standalone save action combined with always() saves partial
+      # compilation results even when Ninja or the simulation fails.
+      - name: Save ccache
+        if: always()
+        uses: actions/cache/save@v4
+        with:
+          path: .ccache
+          key: fdb-ccache-${{ runner.os }}-${{ env.BUILD_TYPE }}-${{ github.run_id }}-${{ github.run_attempt }}
+
+      - name: Upload simulation traces and logs
         if: always()
         uses: actions/upload-artifact@v4
         with:
-          name: fdb-simulation-traces
+          name: fdb-simulation-traces-${{ github.run_id }}-${{ github.run_attempt }}
           path: |
             build/trace.*.xml
             build/trace.*.json
           if-no-files-found: ignore
+          retention-days: 14
+
+      - name: Show final disk usage
+        if: always()
+        run: |
+          df -h
+          du -sh build .ccache 2>/dev/null || true
