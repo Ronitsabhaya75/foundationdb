@@ -17,7 +17,7 @@ on:
     paths:
       - ".github/workflows/ratekeeper-benchmarks.yml"
       - "contrib/ratekeeper_benchmarks/**"
-      - "tests/research/ratekeeper/**"
+      - "contrib/ratekeeper_benchmarks/scenarios/**"
       - "fdbserver/ratekeeper/**"
       - "fdbserver/grvproxy/**"
       - "fdbserver/workloads/ReadWrite.cpp"
@@ -30,7 +30,7 @@ on:
     paths:
       - ".github/workflows/ratekeeper-benchmarks.yml"
       - "contrib/ratekeeper_benchmarks/**"
-      - "tests/research/ratekeeper/**"
+      - "contrib/ratekeeper_benchmarks/scenarios/**"
       - "fdbserver/ratekeeper/**"
       - "fdbserver/grvproxy/**"
 
@@ -159,7 +159,7 @@ jobs:
 
           result=0
           for scenario in "${scenarios[@]}"; do
-            test_file="tests/research/ratekeeper/${scenario}.toml"
+            test_file="contrib/ratekeeper_benchmarks/scenarios/${scenario}.toml"
             test -f "$test_file" || {
               echo "Missing benchmark definition: $test_file" >&2
               exit 2
