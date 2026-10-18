@@ -89,12 +89,11 @@ jobs:
                 -D BUILD_SWIFT_BINDING=OFF \
                 -D BUILD_TESTING=OFF \
                 -D ENABLE_UNIT_TESTS=OFF \
-                -D WITH_ROCKSDB=OFF \
                 -D USE_CCACHE=ON \
                 -D USE_LD=LLD \
                 -D USE_LIBCXX=1 \
                 -D USE_WERROR=OFF \
-                ..
+              ..
 
               # Build fdbserver entirely from the checked-out source.
               ninja fdbserver
