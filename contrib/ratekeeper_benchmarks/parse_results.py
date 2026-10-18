@@ -29,6 +29,13 @@ FAULT_WINDOWS = {
 }
 
 WORKLOAD_DURATION_SECONDS = 60.0
+OPERATIONS_PER_TRANSACTION = 10.0
+REQUIRED_SCENARIOS = {
+    "baseline",
+    "network_clog_mild",
+    "network_clog_severe",
+    "slow_storage",
+}
 
 
 def finite_float(value: str) -> float | None:
@@ -115,6 +122,23 @@ def parse_trace(path: Path, scenario: str, seed: int) -> list[dict]:
             else event_time
         )
 
+        if event_type in {
+            "CloggingPair",
+            "SetDiskFailure",
+            "AddFailureInjectionWorkload",
+        }:
+            rows.append(
+                {
+                    "scenario": scenario,
+                    "seed": seed,
+                    "client_id": None,
+                    "time_seconds": relative_time,
+                    "source": "fault",
+                    "metric": event_type,
+                    "value": 1.0,
+                }
+            )
+
         # Only export controller and latency events from the measured workload.
         if (
             workload_start is not None
@@ -136,6 +160,27 @@ def parse_trace(path: Path, scenario: str, seed: int) -> list[dict]:
                             "source": event_type,
                             "metric": metric,
                             "value": value,
+                        }
+                    )
+
+        if event_type == "ReadWrite_CommitLatency":
+            for field, label in (
+                ("Median", "Commit p50 latency (ms)"),
+                ("Percentile95", "Commit p95 latency (ms)"),
+                ("Percentile99", "Commit p99 latency (ms)"),
+            ):
+                value = finite_float(attrs.get(field, ""))
+                # An empty interval is emitted as zero; it has no latency percentile.
+                if value is not None and value > 0:
+                    rows.append(
+                        {
+                            "scenario": scenario,
+                            "seed": seed,
+                            "client_id": None,
+                            "time_seconds": relative_time,
+                            "source": event_type,
+                            "metric": label,
+                            "value": value * 1000.0,
                         }
                     )
 
@@ -219,6 +264,172 @@ def recovery_seconds(
 
 def fmt(value: float | None, digits: int = 2) -> str:
     return "n/a" if value is None else f"{value:.{digits}f}"
+
+
+def metric_values(
+    rows: list[dict], scenario: str, seed: int, metric: str, start: float, end: float
+) -> list[float]:
+    return [
+        row["value"]
+        for row in rows
+        if row["scenario"] == scenario
+        and row["seed"] == seed
+        and row["metric"] == metric
+        and row["time_seconds"] is not None
+        and start <= row["time_seconds"] <= end
+    ]
+
+
+def final_seed_value(rows: list[dict], scenario: str, seed: int, metric: str) -> float | None:
+    values = [
+        row["value"]
+        for row in rows
+        if row["scenario"] == scenario
+        and row["seed"] == seed
+        and row["source"] == "workload"
+        and row["time_seconds"] is None
+        and row["metric"] == metric
+    ]
+    return sum(values) if values else None
+
+
+def make_paper_rows(rows: list[dict], statuses: dict[str, str]) -> list[dict]:
+    """Create one paired, analysis-ready row per scenario and deterministic seed."""
+    output: list[dict] = []
+    all_scenarios = sorted({row["scenario"] for row in rows} | set(statuses))
+    baseline_ops = periodic_seed_values(rows, "baseline", "Operations/sec", "sum")
+    baseline_p95 = periodic_seed_values(
+        rows, "baseline", "95% Commit Latency (ms, averaged)", "median"
+    )
+
+    for scenario in all_scenarios:
+        seeds = sorted({row["seed"] for row in rows if row["scenario"] == scenario})
+        start, end = FAULT_WINDOWS.get(scenario, (0.0, WORKLOAD_DURATION_SECONDS))
+        ops_by_seed = periodic_seed_values(rows, scenario, "Operations/sec", "sum")
+        phase_p95 = periodic_seed_values(
+            rows, scenario, "95% Commit Latency (ms, averaged)", "median"
+        )
+        for seed in seeds:
+            phase_ops = [
+                value
+                for second, value in ops_by_seed.get(seed, {}).items()
+                if start <= second <= end
+            ]
+            latency = {
+                percentile: median(metric_values(rows, scenario, seed, metric, start, end))
+                for percentile, metric in (
+                    ("p50", "Commit p50 latency (ms)"),
+                    ("p95", "Commit p95 latency (ms)"),
+                    ("p99", "Commit p99 latency (ms)"),
+                )
+            }
+            rk_limits = metric_values(rows, scenario, seed, "TPSLimit", start, end)
+            released = metric_values(rows, scenario, seed, "ReleasedTPS", start, end)
+            queues = metric_values(
+                rows, scenario, seed, "WorstStorageServerQueue", start, end
+            ) + metric_values(rows, scenario, seed, "WorstTLogQueue", start, end)
+            durability = metric_values(
+                rows, scenario, seed, "WorstStorageServerDurabilityLag", start, end
+            )
+            version_lag = metric_values(
+                rows, scenario, seed, "WorstStorageServerVersionLag", start, end
+            )
+
+            recovery = None
+            if scenario != "baseline" and seed in baseline_ops and seed in baseline_p95:
+                baseline_ops_median = median(list(baseline_ops[seed].values()))
+                baseline_p95_median = median(list(baseline_p95[seed].values()))
+                if baseline_ops_median is not None and baseline_p95_median is not None:
+                    recovery = recovery_seconds(
+                        ops_by_seed.get(seed, {}),
+                        phase_p95.get(seed, {}),
+                        end,
+                        baseline_ops_median,
+                        baseline_p95_median,
+                    )
+
+            output.append(
+                {
+                    "scenario": scenario,
+                    "seed": seed,
+                    "status": statuses.get(scenario, "unknown"),
+                    "phase_start_seconds": start,
+                    "phase_end_seconds": end,
+                    "commit_p50_ms": latency["p50"],
+                    "commit_p95_ms": latency["p95"],
+                    "commit_p99_ms": latency["p99"],
+                    "successful_transactions_per_second": (
+                        median(phase_ops) / OPERATIONS_PER_TRANSACTION if phase_ops else None
+                    ),
+                    "whole_run_successful_transactions_per_second": final_seed_value(
+                        rows, scenario, seed, "Transactions/sec"
+                    ),
+                    "retryable_transaction_errors": final_seed_value(
+                        rows, scenario, seed, "Retries"
+                    ),
+                    "terminal_run_failure": int(statuses.get(scenario) != "pass"),
+                    "recovery_seconds": recovery,
+                    "ratekeeper_limit_min_tps": min(rk_limits) if rk_limits else None,
+                    "ratekeeper_limit_median_tps": median(rk_limits),
+                    "ratekeeper_released_median_tps": median(released),
+                    "max_queue_bytes": max(queues) if queues else None,
+                    "max_durability_lag_versions": max(durability) if durability else None,
+                    "max_version_lag_versions": max(version_lag) if version_lag else None,
+                    "server_cpu_percent": None,
+                    "server_cpu_status": "not_applicable_in_deterministic_simulation",
+                }
+            )
+    return output
+
+
+def validate_dataset(
+    rows: list[dict], statuses: dict[str, str], expected_seed_count: int | None
+) -> list[str]:
+    errors: list[str] = []
+    found = set(statuses)
+    if found != REQUIRED_SCENARIOS:
+        errors.append(
+            f"scenario set mismatch: expected {sorted(REQUIRED_SCENARIOS)}, found {sorted(found)}"
+        )
+    for scenario in sorted(REQUIRED_SCENARIOS):
+        seeds = {row["seed"] for row in rows if row["scenario"] == scenario}
+        if expected_seed_count is not None and len(seeds) != expected_seed_count:
+            errors.append(f"{scenario}: expected {expected_seed_count} seeds, found {len(seeds)}")
+        if statuses.get(scenario) != "pass":
+            errors.append(f"{scenario}: simulation status is {statuses.get(scenario, 'missing')}")
+        for metric in (
+            "Commit p50 latency (ms)",
+            "Commit p95 latency (ms)",
+            "Commit p99 latency (ms)",
+            "Transactions/sec",
+            "Retries",
+            "TPSLimit",
+            "WorstStorageServerDurabilityLag",
+        ):
+            if not any(row["scenario"] == scenario and row["metric"] == metric for row in rows):
+                errors.append(f"{scenario}: required metric missing: {metric}")
+
+        fault_counts = {
+            metric: sum(
+                1 for row in rows if row["scenario"] == scenario and row["metric"] == metric
+            )
+            for metric in ("CloggingPair", "SetDiskFailure", "AddFailureInjectionWorkload")
+        }
+        if fault_counts["AddFailureInjectionWorkload"]:
+            errors.append(f"{scenario}: unexpected automatic failure workload detected")
+        if scenario == "baseline" and (
+            fault_counts["CloggingPair"] or fault_counts["SetDiskFailure"]
+        ):
+            errors.append("baseline: fault events detected")
+        if scenario.startswith("network_clog") and not fault_counts["CloggingPair"]:
+            errors.append(f"{scenario}: no CloggingPair events detected")
+        if scenario.startswith("network_clog") and fault_counts["SetDiskFailure"]:
+            errors.append(f"{scenario}: unexpected disk failure events detected")
+        if scenario == "slow_storage" and not fault_counts["SetDiskFailure"]:
+            errors.append("slow_storage: no SetDiskFailure events detected")
+        if scenario == "slow_storage" and fault_counts["CloggingPair"]:
+            errors.append("slow_storage: unexpected network clog events detected")
+    return errors
 
 
 def build_evidence(rows: list[dict], statuses: dict[str, str]) -> str:
@@ -330,10 +541,86 @@ def build_evidence(rows: list[dict], statuses: dict[str, str]) -> str:
     return "\n".join(lines) + "\n"
 
 
+def build_paper_evidence(rows: list[dict], statuses: dict[str, str]) -> str:
+    paper_rows = make_paper_rows(rows, statuses)
+    by_scenario: dict[str, list[dict]] = defaultdict(list)
+    for row in paper_rows:
+        by_scenario[row["scenario"]].append(row)
+
+    def med(scenario_rows: list[dict], field: str) -> float | None:
+        values = [row[field] for row in scenario_rows if row[field] is not None]
+        return median(values)
+
+    lines = [
+        "# Ratekeeper degradation benchmark",
+        "",
+        "Results are paired by deterministic seed. Latencies are client-side commit latencies; throughput is successful transactions per second during the measured phase. A simulation PASS establishes correctness, not acceptable performance.",
+        "",
+        "## Primary outcomes",
+        "",
+        "| Scenario | Seeds | Status | Commit p50 (ms) | Commit p95 (ms) | Commit p99 (ms) | Successful tx/s | Retryable errors | Recovery (runs) |",
+        "|---|---:|---|---:|---:|---:|---:|---:|---:|",
+    ]
+    for scenario in sorted(by_scenario):
+        scenario_rows = by_scenario[scenario]
+        recoveries = [row["recovery_seconds"] for row in scenario_rows if row["recovery_seconds"] is not None]
+        recovery = (
+            "n/a"
+            if scenario == "baseline"
+            else (
+                f"{fmt(median(recoveries))}s ({len(recoveries)}/{len(scenario_rows)})"
+                if recoveries
+                else f"not recovered (0/{len(scenario_rows)})"
+            )
+        )
+        lines.append(
+            f"| {scenario} | {len(scenario_rows)} | {statuses.get(scenario, 'unknown')} | "
+            f"{fmt(med(scenario_rows, 'commit_p50_ms'))} | "
+            f"{fmt(med(scenario_rows, 'commit_p95_ms'))} | "
+            f"{fmt(med(scenario_rows, 'commit_p99_ms'))} | "
+            f"{fmt(med(scenario_rows, 'successful_transactions_per_second'))} | "
+            f"{fmt(med(scenario_rows, 'retryable_transaction_errors'), 0)} | {recovery} |"
+        )
+
+    lines.extend(
+        [
+            "",
+            "## Secondary signals",
+            "",
+            "| Scenario | Min Ratekeeper limit (tx/s) | Median released (tx/s) | Max queue (bytes) | Max durability lag (versions) | Max version lag (versions) | Server CPU |",
+            "|---|---:|---:|---:|---:|---:|---|",
+        ]
+    )
+    for scenario in sorted(by_scenario):
+        scenario_rows = by_scenario[scenario]
+        lines.append(
+            f"| {scenario} | {fmt(med(scenario_rows, 'ratekeeper_limit_min_tps'))} | "
+            f"{fmt(med(scenario_rows, 'ratekeeper_released_median_tps'))} | "
+            f"{fmt(med(scenario_rows, 'max_queue_bytes'), 0)} | "
+            f"{fmt(med(scenario_rows, 'max_durability_lag_versions'), 0)} | "
+            f"{fmt(med(scenario_rows, 'max_version_lag_versions'), 0)} | n/a (simulation) |"
+        )
+
+    lines.extend(
+        [
+            "",
+            "## Interpretation guardrails",
+            "",
+            "- `retryable_transaction_errors` means ReadWrite workload retries. Terminal simulation failures are tracked separately in `paper_results.csv`.",
+            "- CPU is not reported from deterministic simulation because it is not representative of physical server utilization. Add a controlled real-cluster experiment for that metric.",
+            "- CI checks data completeness and fault isolation. It does not declare the research hypothesis proven.",
+            "- Use `paper_results.csv` for paired statistics and plots, `metrics.csv` for time series, and `ratekeeper.csv` for controller analysis.",
+        ]
+    )
+    return "\n".join(lines) + "\n"
+
+
 def main() -> None:
     parser = argparse.ArgumentParser()
     parser.add_argument("--results", type=Path, required=True)
     parser.add_argument("--output", type=Path, required=True)
+    parser.add_argument("--expected-seeds", type=int)
+    parser.add_argument("--strict", action="store_true")
     args = parser.parse_args()
     args.output.mkdir(parents=True, exist_ok=True)
 
@@ -370,12 +657,52 @@ def main() -> None:
         writer.writeheader()
         writer.writerows(ratekeeper_rows)
 
-    evidence = build_evidence(rows, statuses)
+    paper_rows = make_paper_rows(rows, statuses)
+    paper_fields = list(paper_rows[0]) if paper_rows else []
+    with (args.output / "paper_results.csv").open("w", newline="") as handle:
+        if paper_fields:
+            writer = csv.DictWriter(handle, fieldnames=paper_fields)
+            writer.writeheader()
+            writer.writerows(paper_rows)
+
+    validation_errors = validate_dataset(rows, statuses, args.expected_seeds)
+    validation_lines = ["# Benchmark validity", ""]
+    if validation_errors:
+        validation_lines.extend(["**FAIL**", ""] + [f"- {error}" for error in validation_errors])
+    else:
+        validation_lines.extend(
+            [
+                "**PASS**",
+                "",
+                "All scenarios, seeds, primary measurements, Ratekeeper signals, and expected fault-isolation checks are present.",
+            ]
+        )
+    validation_lines.extend(
+        [
+            "",
+            "`retryable_transaction_errors` is the workload retry count. Terminal simulation failure is reported separately. Server CPU is intentionally marked unavailable because deterministic simulation CPU is not representative of a physical FDB server.",
+        ]
+    )
+    (args.output / "validity.md").write_text("\n".join(validation_lines) + "\n")
+
+    evidence = build_paper_evidence(rows, statuses)
     (args.output / "evidence.md").write_text(evidence)
     (args.output / "summary.json").write_text(
-        json.dumps({"statuses": statuses, "metric_rows": len(rows)}, indent=2) + "\n"
+        json.dumps(
+            {
+                "statuses": statuses,
+                "metric_rows": len(rows),
+                "paper_rows": len(paper_rows),
+                "validation_errors": validation_errors,
+            },
+            indent=2,
+        )
+        + "\n"
     )
     print(evidence)
+    print((args.output / "validity.md").read_text())
+    if args.strict and validation_errors:
+        raise SystemExit(1)
 
 
 if __name__ == "__main__":

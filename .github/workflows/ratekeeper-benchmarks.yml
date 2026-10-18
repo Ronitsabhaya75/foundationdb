@@ -3,10 +3,18 @@ name: Ratekeeper Degradation Benchmarks
 on:
   workflow_dispatch:
     inputs:
+      profile:
+        description: "Run size: smoke validates CI; paper collects a larger paired sample"
+        required: true
+        type: choice
+        options:
+          - smoke
+          - paper
+        default: smoke
       seeds:
-        description: "Space-separated deterministic simulation seeds"
+        description: "Optional space-separated seeds (overrides the selected profile)"
         required: false
-        default: "101 202 303"
+        default: ""
       build_jobs:
         description: "Parallel Ninja jobs (use 1 if the runner is OOM-killed)"
         required: false
@@ -24,16 +32,6 @@ on:
       - "fdbserver/workloads/ReadWriteWorkload.h"
       - "fdbserver/workloads/RandomClogging.cpp"
       - "fdbserver/workloads/DiskFailureInjection.cpp"
-  push:
-    branches:
-      - main
-    paths:
-      - ".github/workflows/ratekeeper-benchmarks.yml"
-      - "contrib/ratekeeper_benchmarks/**"
-      - "contrib/ratekeeper_benchmarks/scenarios/**"
-      - "fdbserver/ratekeeper/**"
-      - "fdbserver/grvproxy/**"
-
 permissions:
   contents: read
 
@@ -49,7 +47,8 @@ jobs:
 
     env:
       BUILD_TYPE: Release
-      SEEDS: ${{ inputs.seeds || '101 202 303' }}
+      PROFILE: ${{ inputs.profile || 'smoke' }}
+      SEEDS: ${{ inputs.seeds || (inputs.profile == 'paper' && '101 202 303 404 505 606 707 808 909 1010' || '101 202 303') }}
       BUILD_JOBS: ${{ inputs.build_jobs || '2' }}
       CCACHE_DIR: ${{ github.workspace }}/.ccache
       CCACHE_MAXSIZE: 2G
@@ -132,6 +131,34 @@ jobs:
               ccache --show-stats || true
             '
 
+      - name: Record reproducibility manifest
+        run: |
+          set -euo pipefail
+          image_id=$(docker image inspect --format '{{.Id}}' docker.io/foundationdb/build:rockylinux9-latest)
+          binary_sha=$(sha256sum build/bin/fdbserver | cut -d' ' -f1)
+          binary_version=$(build/bin/fdbserver --version | tr '\n' ' ')
+          scenario_sha=$(find contrib/ratekeeper_benchmarks/scenarios -name '*.toml' -type f -print0 | sort -z | xargs -0 sha256sum)
+          python3 - "$image_id" "$binary_sha" "$binary_version" "$scenario_sha" <<'PY'
+          import json, os, platform, sys
+          manifest = {
+              "git_commit": os.environ["GITHUB_SHA"],
+              "git_ref": os.environ["GITHUB_REF"],
+              "workflow_run_id": os.environ["GITHUB_RUN_ID"],
+              "workflow_run_attempt": os.environ["GITHUB_RUN_ATTEMPT"],
+              "profile": os.environ["PROFILE"],
+              "seeds": [int(seed) for seed in os.environ["SEEDS"].split()],
+              "build_type": os.environ["BUILD_TYPE"],
+              "build_image_id": sys.argv[1],
+              "fdbserver_sha256": sys.argv[2],
+              "fdbserver_version": sys.argv[3].strip(),
+              "scenario_sha256": sys.argv[4].splitlines(),
+              "runner_platform": platform.platform(),
+          }
+          with open("benchmark-results/manifest.json", "w") as handle:
+              json.dump(manifest, handle, indent=2)
+              handle.write("\n")
+          PY
+
       - name: Prepare ccache for upload
         if: always()
         run: |
@@ -193,11 +220,15 @@ jobs:
         if: always()
         run: |
           set -euo pipefail
+          expected_seeds=$(wc -w <<< "$SEEDS" | tr -d ' ')
           python3 contrib/ratekeeper_benchmarks/parse_results.py \
             --results benchmark-results \
-            --output benchmark-results/summary
+            --output benchmark-results/summary \
+            --expected-seeds "$expected_seeds" \
+            --strict
 
           cat benchmark-results/summary/evidence.md >> "$GITHUB_STEP_SUMMARY"
+          cat benchmark-results/summary/validity.md >> "$GITHUB_STEP_SUMMARY"
 
       - name: Prepare benchmark artifacts
         if: always()
@@ -215,7 +246,8 @@ jobs:
             benchmark-results/**/status.txt
             benchmark-results/**/trace.*.xml
             benchmark-results/**/trace.*.json
+            benchmark-results/manifest.json
             benchmark-results/summary/**
           if-no-files-found: error
-          retention-days: 30
+          retention-days: ${{ inputs.profile == 'paper' && 90 || 30 }}
 
