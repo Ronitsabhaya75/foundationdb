@@ -199,12 +199,23 @@ jobs:
 
           cat benchmark-results/summary/evidence.md >> "$GITHUB_STEP_SUMMARY"
 
+      - name: Prepare benchmark artifacts
+        if: always()
+        run: |
+          set -euo pipefail
+          sudo chown -R "$(id -u):$(id -g)" benchmark-results
+
       - name: Upload raw traces and benchmark summaries
         if: always()
         uses: actions/upload-artifact@v4
         with:
           name: ratekeeper-benchmarks-${{ github.run_id }}-${{ github.run_attempt }}
-          path: benchmark-results
+          path: |
+            benchmark-results/**/simulation.log
+            benchmark-results/**/status.txt
+            benchmark-results/**/trace.*.xml
+            benchmark-results/**/trace.*.json
+            benchmark-results/summary/**
           if-no-files-found: error
           retention-days: 30
 
