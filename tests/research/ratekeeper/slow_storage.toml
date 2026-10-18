@@ -1,0 +1,31 @@
+[[test]]
+testTitle = 'RatekeeperSlowStorage'
+
+    [[test.workload]]
+    testName = 'ReadWrite'
+    description = 'RatekeeperSlowStorage'
+    testDuration = 60.0
+    transactionsPerSecond = 5000.0
+    allowedLatency = 1.0
+    nodeCount = 100000
+    readsPerTransactionA = 10
+    writesPerTransactionA = 0
+    readsPerTransactionB = 1
+    writesPerTransactionB = 9
+    alpha = 0.1
+    enableReadLatencyLogging = true
+    periodicLoggingInterval = 5.0
+    discardEdgeMeasurements = false
+
+    # One storage worker is slowed from approximately T=10s through T=35s.
+    [[test.workload]]
+    testName = 'DiskFailureInjection'
+    startDelay = 10.0
+    testDuration = 35.0
+    throttleDisk = true
+    workersToThrottle = 1
+    stallInterval = 0.0
+    stallPeriod = 0.0
+    throttlePeriod = 25.0
+    periodicBroadcastInterval = 5.0
+

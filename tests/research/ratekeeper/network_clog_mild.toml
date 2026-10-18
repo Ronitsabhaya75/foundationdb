@@ -1,0 +1,27 @@
+[[test]]
+testTitle = 'RatekeeperNetworkClogMild'
+
+    [[test.workload]]
+    testName = 'ReadWrite'
+    description = 'RatekeeperNetworkClogMild'
+    testDuration = 60.0
+    transactionsPerSecond = 5000.0
+    allowedLatency = 1.0
+    nodeCount = 100000
+    readsPerTransactionA = 10
+    writesPerTransactionA = 0
+    readsPerTransactionB = 1
+    writesPerTransactionB = 9
+    alpha = 0.1
+    enableReadLatencyLogging = true
+    periodicLoggingInterval = 5.0
+    discardEdgeMeasurements = false
+
+    # Fault window: approximately T=0s through T=25s.
+    [[test.workload]]
+    testName = 'RandomClogging'
+    testDuration = 25.0
+    scale = 0.25
+    clogginess = 0.5
+    swizzle = 0
+
