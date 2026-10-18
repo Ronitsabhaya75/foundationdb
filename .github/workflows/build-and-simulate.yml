@@ -87,6 +87,9 @@ jobs:
               cmake -G Ninja \
                 -D CMAKE_BUILD_TYPE="$BUILD_TYPE" \
                 -D BUILD_SWIFT_BINDING=OFF \
+                -D BUILD_TESTING=OFF \
+                -D ENABLE_UNIT_TESTS=OFF \
+                -D WITH_ROCKSDB=OFF \
                 -D USE_CCACHE=ON \
                 -D USE_LD=LLD \
                 -D USE_LIBCXX=1 \
