@@ -1,5 +1,6 @@
 [[test]]
 testTitle = 'RatekeeperSlowStorage'
+runFailureWorkloads = false
 
     [[test.workload]]
     testName = 'ReadWrite'

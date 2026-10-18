@@ -1,5 +1,6 @@
 [[test]]
 testTitle = 'RatekeeperNetworkClogSevere'
+runFailureWorkloads = false
 
     [[test.workload]]
     testName = 'ReadWrite'
@@ -17,7 +18,7 @@ testTitle = 'RatekeeperNetworkClogSevere'
     periodicLoggingInterval = 5.0
     discardEdgeMeasurements = false
 
-    # Fault window: approximately T=0s through T=30s.
+    # Explicit fault window: approximately T=0s through T=30s.
     [[test.workload]]
     testName = 'RandomClogging'
     testDuration = 30.0

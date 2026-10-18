@@ -1,5 +1,6 @@
 [[test]]
 testTitle = 'RatekeeperBaseline'
+runFailureWorkloads = false
 
     [[test.workload]]
     testName = 'ReadWrite'
