@@ -26,7 +26,7 @@ on:
       - "fdbserver/workloads/DiskFailureInjection.cpp"
   push:
     branches:
-      - "research/**"
+      - main
     paths:
       - ".github/workflows/ratekeeper-benchmarks.yml"
       - "contrib/ratekeeper_benchmarks/**"
