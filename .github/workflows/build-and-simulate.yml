@@ -56,29 +56,36 @@ jobs:
             fdb-ccache-${{ runner.os }}-${{ github.ref_name }}-
             fdb-ccache-${{ runner.os }}-
 
-      - name: Build and Run in Official FDB Build Container
+      - name: Compile fdbserver from source and run simulation
+        env:
+          BUILD_TYPE: ${{ inputs.build_type || 'Release' }}
+          TEST_FILE: ${{ inputs.test_file || 'tests/fast/MaxGrvQueueDelay.toml' }}
         run: |
-          mkdir -p build .ccache
-          TARGET="${{ github.event.inputs.build_target || 'fdbserver' }}"
-          BUILD_TYPE="${{ github.event.inputs.build_type || 'Release' }}"
-          TEST_FILE="${{ github.event.inputs.test_file || 'tests/fast/MaxGrvQueueDelay.toml' }}"
+          set -euo pipefail
 
-          echo "Building target: ${TARGET} in ${BUILD_TYPE} mode"
-          echo "Test file to run: ${TEST_FILE}"
+          test -f "$TEST_FILE"
+          mkdir -p build .ccache
+
+          echo "Compiling fdbserver from commit $GITHUB_SHA"
+          echo "Build type: $BUILD_TYPE"
+          echo "Simulation: $TEST_FILE"
 
           docker run --rm \
-            -v ${{ github.workspace }}:/workspace \
-            -v ${{ github.workspace }}/.ccache:/root/.ccache \
+            -v "${{ github.workspace }}:/workspace" \
+            -v "${{ github.workspace }}/.ccache:/root/.ccache" \
+            -e BUILD_TYPE="$BUILD_TYPE" \
+            -e TEST_FILE="$TEST_FILE" \
             -e CCACHE_DIR=/root/.ccache \
             -e CCACHE_MAXSIZE=5G \
+            -e GOFLAGS=-buildvcs=false \
             -w /workspace/build \
             docker.io/foundationdb/build:rockylinux9-latest \
-            bash -c "
-              set -e
+            bash -euo pipefail -c '
               source /opt/rh/gcc-toolset-13/enable || true
+              git config --global --add safe.directory /workspace
 
               cmake -G Ninja \
-                -D CMAKE_BUILD_TYPE=\${BUILD_TYPE} \
+                -D CMAKE_BUILD_TYPE="$BUILD_TYPE" \
                 -D BUILD_SWIFT_BINDING=OFF \
                 -D USE_CCACHE=ON \
                 -D USE_LD=LLD \
@@ -86,17 +93,22 @@ jobs:
                 -D USE_WERROR=OFF \
                 ..
 
-              ninja \${TARGET}
+              # Build fdbserver entirely from the checked-out source.
+              ninja fdbserver
 
-              if [ -f \"\${TARGET}\" ] || [ -f \"bin/\${TARGET}\" ]; then
-                echo 'Build completed successfully!'
-              fi
+              test -x bin/fdbserver
 
-              if [ -n \"\${TEST_FILE}\" ] && [ -f \"../\${TEST_FILE}\" ]; then
-                echo \"Running simulation test: \${TEST_FILE}\"
-                bin/fdbserver -r simulation -f ../\${TEST_FILE} || true
-              fi
-            "
+              echo "Compiled binary:"
+              bin/fdbserver --version
+              ccache --show-stats || true
+
+              echo "Running simulation: $TEST_FILE"
+              bin/fdbserver \
+                -r simulation \
+                -f "../$TEST_FILE" \
+                --seed 12345 \
+                --buggify off
+            '
 
       - name: Upload Test Traces and Logs
         if: always()
