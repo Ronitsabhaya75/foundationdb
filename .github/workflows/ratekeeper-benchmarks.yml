@@ -19,6 +19,14 @@ on:
         description: "Parallel Ninja jobs (use 1 if the runner is OOM-killed)"
         required: false
         default: "2"
+      resume_run_id:
+        description: "Optional prior workflow run whose artifact should be resumed"
+        required: false
+        default: ""
+      resume_run_attempt:
+        description: "Attempt number of the prior workflow run"
+        required: false
+        default: "1"
   pull_request:
     branches:
       - main
@@ -34,6 +42,7 @@ on:
       - "fdbserver/workloads/DiskFailureInjection.cpp"
 permissions:
   contents: read
+  actions: read
 
 concurrency:
   group: ratekeeper-benchmarks-${{ github.ref }}
@@ -52,6 +61,10 @@ jobs:
       BUILD_JOBS: ${{ inputs.build_jobs || '2' }}
       CCACHE_DIR: ${{ github.workspace }}/.ccache
       CCACHE_MAXSIZE: 2G
+      # PR #2 timed out after preserving 87 complete runs. Resume that artifact
+      # only for this research PR; other PRs start from an empty result set.
+      RESUME_RUN_ID: ${{ inputs.resume_run_id || (github.event_name == 'pull_request' && github.event.pull_request.number == 2 && '39149936910') || '' }}
+      RESUME_RUN_ATTEMPT: ${{ inputs.resume_run_attempt || '1' }}
 
     steps:
       - name: Free disk space
@@ -91,6 +104,42 @@ jobs:
 
       - name: Prepare directories
         run: mkdir -p build .ccache benchmark-results
+
+      - name: Restore completed benchmark seeds
+        if: env.RESUME_RUN_ID != ''
+        uses: actions/download-artifact@v4
+        with:
+          name: ratekeeper-benchmarks-${{ env.RESUME_RUN_ID }}-${{ env.RESUME_RUN_ATTEMPT }}
+          path: benchmark-results
+          repository: ${{ github.repository }}
+          run-id: ${{ env.RESUME_RUN_ID }}
+          github-token: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Validate restored benchmark checkpoint
+        if: env.RESUME_RUN_ID != ''
+        run: |
+          set -euo pipefail
+          test -f benchmark-results/manifest.json
+          python3 - <<'PY'
+          import json
+          import os
+          from pathlib import Path
+
+          path = Path("benchmark-results/manifest.json")
+          manifest = json.loads(path.read_text())
+          expected_run = os.environ["RESUME_RUN_ID"]
+          if manifest.get("workflow_run_id") != expected_run:
+              raise SystemExit(
+                  f"Checkpoint run mismatch: expected {expected_run}, "
+                  f"found {manifest.get('workflow_run_id')}"
+              )
+          expected_seeds = [int(seed) for seed in os.environ["SEEDS"].split()]
+          if manifest.get("seeds") != expected_seeds:
+              raise SystemExit("Checkpoint seed list does not match this run")
+          destination = Path(f"benchmark-results/prior-manifest-{expected_run}.json")
+          destination.write_text(json.dumps(manifest, indent=2) + "\n")
+          print(f"Restored checkpoint from workflow run {expected_run}")
+          PY
 
       - name: Restore ccache
         id: ccache-restore
@@ -153,6 +202,12 @@ jobs:
               "git_ref": os.environ["GITHUB_REF"],
               "workflow_run_id": os.environ["GITHUB_RUN_ID"],
               "workflow_run_attempt": os.environ["GITHUB_RUN_ATTEMPT"],
+              "resumed_from_workflow_run_id": os.environ.get("RESUME_RUN_ID") or None,
+              "resumed_from_workflow_run_attempt": (
+                  os.environ.get("RESUME_RUN_ATTEMPT")
+                  if os.environ.get("RESUME_RUN_ID")
+                  else None
+              ),
               "profile": os.environ["PROFILE"],
               "seeds": [int(seed) for seed in os.environ["SEEDS"].split()],
               "build_type": os.environ["BUILD_TYPE"],
@@ -206,6 +261,15 @@ jobs:
               container_run_dir="/workspace/benchmark-results/${scenario}/seed-${seed}"
               mkdir -p "$host_run_dir"
 
+              if [[ -f "$host_run_dir/status.txt" ]] &&
+                 [[ "$(<"$host_run_dir/status.txt")" == "PASS" ]]; then
+                echo "SKIP ${scenario} seed=${seed}: restored PASS result"
+                continue
+              fi
+
+              # Remove a partial checkpoint before rerunning that exact seed.
+              find "$host_run_dir" -mindepth 1 -delete
+
               echo "::group::${scenario} seed=${seed}"
               if docker run --rm \
                 -v "${{ github.workspace }}:/workspace" \
@@ -255,8 +319,8 @@ jobs:
             benchmark-results/**/status.txt
             benchmark-results/**/trace.*.xml
             benchmark-results/**/trace.*.json
-            benchmark-results/manifest.json
+            benchmark-results/*.json
             benchmark-results/summary/**
           if-no-files-found: error
-          retention-days: ${{ inputs.profile == 'paper' && 90 || 30 }}
+          retention-days: ${{ env.PROFILE == 'paper' && 90 || 30 }}
 

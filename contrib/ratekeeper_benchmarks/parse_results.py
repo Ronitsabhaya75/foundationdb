@@ -311,7 +311,11 @@ def final_seed_value(rows: list[dict], scenario: str, seed: int, metric: str) ->
     return sum(values) if values else None
 
 
-def make_paper_rows(rows: list[dict], statuses: dict[str, str]) -> list[dict]:
+def make_paper_rows(
+    rows: list[dict],
+    statuses: dict[str, str],
+    run_statuses: dict[tuple[str, int], str] | None = None,
+) -> list[dict]:
     """Create one paired, analysis-ready row per scenario and deterministic seed."""
     output: list[dict] = []
     all_scenarios = sorted({row["scenario"] for row in rows} | set(statuses))
@@ -328,6 +332,11 @@ def make_paper_rows(rows: list[dict], statuses: dict[str, str]) -> list[dict]:
             rows, scenario, "95% Commit Latency (ms, averaged)", "median"
         )
         for seed in seeds:
+            run_status = (
+                run_statuses.get((scenario, seed), "unknown")
+                if run_statuses is not None
+                else statuses.get(scenario, "unknown")
+            )
             phase_ops = [
                 value
                 for second, value in ops_by_seed.get(seed, {}).items()
@@ -370,7 +379,7 @@ def make_paper_rows(rows: list[dict], statuses: dict[str, str]) -> list[dict]:
                 {
                     "scenario": scenario,
                     "seed": seed,
-                    "status": statuses.get(scenario, "unknown"),
+                    "status": run_status,
                     "phase_start_seconds": start,
                     "phase_end_seconds": end,
                     "commit_p50_ms": latency["p50"],
@@ -385,7 +394,7 @@ def make_paper_rows(rows: list[dict], statuses: dict[str, str]) -> list[dict]:
                     "retryable_transaction_errors": final_seed_value(
                         rows, scenario, seed, "Retries"
                     ),
-                    "terminal_run_failure": int(statuses.get(scenario) != "pass"),
+                    "terminal_run_failure": int(run_status != "pass"),
                     "recovery_seconds": recovery,
                     "ratekeeper_limit_min_tps": min(rk_limits) if rk_limits else None,
                     "ratekeeper_limit_median_tps": median(rk_limits),
@@ -562,8 +571,12 @@ def build_evidence(rows: list[dict], statuses: dict[str, str]) -> str:
     return "\n".join(lines) + "\n"
 
 
-def build_paper_evidence(rows: list[dict], statuses: dict[str, str]) -> str:
-    paper_rows = make_paper_rows(rows, statuses)
+def build_paper_evidence(
+    rows: list[dict],
+    statuses: dict[str, str],
+    run_statuses: dict[tuple[str, int], str] | None = None,
+) -> str:
+    paper_rows = make_paper_rows(rows, statuses, run_statuses)
     by_scenario: dict[str, list[dict]] = defaultdict(list)
     for row in paper_rows:
         by_scenario[row["scenario"]].append(row)
@@ -651,6 +664,7 @@ def main() -> None:
 
     rows: list[dict] = []
     statuses: dict[str, str] = {}
+    run_statuses: dict[tuple[str, int], str] = {}
     for scenario_dir in sorted(path for path in args.results.iterdir() if path.is_dir()):
         if scenario_dir == args.output:
             continue
@@ -664,7 +678,11 @@ def main() -> None:
             for trace in seed_dir.glob("trace.*.xml"):
                 rows.extend(parse_trace(trace, scenario_dir.name, seed))
             status_path = seed_dir / "status.txt"
-            scenario_statuses.append(status_path.read_text().strip() if status_path.exists() else "MISSING")
+            raw_status = status_path.read_text().strip() if status_path.exists() else "MISSING"
+            scenario_statuses.append(raw_status)
+            run_statuses[(scenario_dir.name, seed)] = (
+                "pass" if raw_status == "PASS" else "failure"
+            )
         if scenario_statuses:
             statuses[scenario_dir.name] = (
                 "pass" if all(status == "PASS" for status in scenario_statuses) else "failure"
@@ -682,7 +700,7 @@ def main() -> None:
         writer.writeheader()
         writer.writerows(ratekeeper_rows)
 
-    paper_rows = make_paper_rows(rows, statuses)
+    paper_rows = make_paper_rows(rows, statuses, run_statuses)
     paper_fields = list(paper_rows[0]) if paper_rows else []
     with (args.output / "paper_results.csv").open("w", newline="") as handle:
         if paper_fields:
@@ -717,7 +735,7 @@ def main() -> None:
     )
     (args.output / "validity.md").write_text("\n".join(validation_lines) + "\n")
 
-    evidence = build_paper_evidence(rows, statuses)
+    evidence = build_paper_evidence(rows, statuses, run_statuses)
     (args.output / "evidence.md").write_text(evidence)
     (args.output / "summary.json").write_text(
         json.dumps(
