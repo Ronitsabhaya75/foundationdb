@@ -68,6 +68,13 @@ jobs:
       - name: Checkout source
         uses: actions/checkout@v4
 
+      - name: Apply delayed-fault research instrumentation
+        run: |
+          set -euo pipefail
+          patch_file=contrib/ratekeeper_benchmarks/patches/random-clogging-start-delay.patch
+          git apply --check "$patch_file"
+          git apply "$patch_file"
+
       - name: Validate inputs
         run: |
           set -euo pipefail
@@ -138,7 +145,8 @@ jobs:
           binary_sha=$(sha256sum build/bin/fdbserver | cut -d' ' -f1)
           binary_version=$(build/bin/fdbserver --version | tr '\n' ' ')
           scenario_sha=$(find contrib/ratekeeper_benchmarks/scenarios -name '*.toml' -type f -print0 | sort -z | xargs -0 sha256sum)
-          python3 - "$image_id" "$binary_sha" "$binary_version" "$scenario_sha" <<'PY'
+          patch_sha=$(sha256sum contrib/ratekeeper_benchmarks/patches/random-clogging-start-delay.patch)
+          python3 - "$image_id" "$binary_sha" "$binary_version" "$scenario_sha" "$patch_sha" <<'PY'
           import json, os, platform, sys
           manifest = {
               "git_commit": os.environ["GITHUB_SHA"],
@@ -152,6 +160,7 @@ jobs:
               "fdbserver_sha256": sys.argv[2],
               "fdbserver_version": sys.argv[3].strip(),
               "scenario_sha256": sys.argv[4].splitlines(),
+              "instrumentation_patch_sha256": sys.argv[5],
               "runner_platform": platform.platform(),
           }
           with open("benchmark-results/manifest.json", "w") as handle:

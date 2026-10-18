@@ -5,7 +5,7 @@ runFailureWorkloads = false
     [[test.workload]]
     testName = 'ReadWrite'
     description = 'RatekeeperBaseline'
-    testDuration = 60.0
+    testDuration = 75.0
     transactionsPerSecond = 5000.0
     allowedLatency = 1.0
     nodeCount = 100000

@@ -24,3 +24,5 @@ It uploads raw simulation logs and XML traces, plus:
 The workflow fails on invalid experiments, missing metrics, or failed simulations. It intentionally does not fail on a performance threshold yet. Establish paired baseline distributions first, then select statistically defensible regression thresholds.
 
 See `contrib/ratekeeper_benchmarks/README.md` for metric definitions, limitations, and the publication boundary.
+
+For the full hypothesis experiment, run `.github/workflows/ratekeeper-paper-evidence.yml` manually. It builds once, runs 10 scenarios over 30 paired seeds in parallel, validates the experiment, and emits confidence intervals and multiplicity-corrected hypothesis tests.

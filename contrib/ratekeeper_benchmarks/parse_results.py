@@ -23,12 +23,12 @@ EVENT_RE = re.compile(r"<Event\s+(?P<attrs>.*?)/?>")
 ATTRIBUTE_RE = re.compile(r'(\w+)="([^"]*)"')
 
 FAULT_WINDOWS = {
-    "network_clog_mild": (0.0, 25.0),
-    "network_clog_severe": (0.0, 30.0),
-    "slow_storage": (10.0, 35.0),
+    "network_clog_mild": (15.0, 40.0),
+    "network_clog_severe": (15.0, 45.0),
+    "slow_storage": (15.0, 40.0),
 }
 
-WORKLOAD_DURATION_SECONDS = 60.0
+WORKLOAD_DURATION_SECONDS = 75.0
 OPERATIONS_PER_TRANSACTION = 10.0
 REQUIRED_SCENARIOS = {
     "baseline",
@@ -36,6 +36,24 @@ REQUIRED_SCENARIOS = {
     "network_clog_severe",
     "slow_storage",
 }
+
+
+def fault_window(scenario: str) -> tuple[float, float]:
+    if scenario.startswith("network_clog_mild"):
+        return (15.0, 40.0)
+    if scenario.startswith("network_clog_severe"):
+        return (15.0, 45.0)
+    if scenario.startswith("slow_storage"):
+        return (15.0, 40.0)
+    return (0.0, WORKLOAD_DURATION_SECONDS)
+
+
+def baseline_for_scenario(scenario: str) -> str:
+    if scenario.endswith("_low"):
+        return "baseline_low"
+    if scenario.endswith("_high"):
+        return "baseline_high"
+    return "baseline"
 
 
 def finite_float(value: str) -> float | None:
@@ -297,14 +315,14 @@ def make_paper_rows(rows: list[dict], statuses: dict[str, str]) -> list[dict]:
     """Create one paired, analysis-ready row per scenario and deterministic seed."""
     output: list[dict] = []
     all_scenarios = sorted({row["scenario"] for row in rows} | set(statuses))
-    baseline_ops = periodic_seed_values(rows, "baseline", "Operations/sec", "sum")
-    baseline_p95 = periodic_seed_values(
-        rows, "baseline", "95% Commit Latency (ms, averaged)", "median"
-    )
-
     for scenario in all_scenarios:
         seeds = sorted({row["seed"] for row in rows if row["scenario"] == scenario})
-        start, end = FAULT_WINDOWS.get(scenario, (0.0, WORKLOAD_DURATION_SECONDS))
+        start, end = fault_window(scenario)
+        baseline_scenario = baseline_for_scenario(scenario)
+        baseline_ops = periodic_seed_values(rows, baseline_scenario, "Operations/sec", "sum")
+        baseline_p95 = periodic_seed_values(
+            rows, baseline_scenario, "95% Commit Latency (ms, averaged)", "median"
+        )
         ops_by_seed = periodic_seed_values(rows, scenario, "Operations/sec", "sum")
         phase_p95 = periodic_seed_values(
             rows, scenario, "95% Commit Latency (ms, averaged)", "median"
@@ -336,7 +354,7 @@ def make_paper_rows(rows: list[dict], statuses: dict[str, str]) -> list[dict]:
             )
 
             recovery = None
-            if scenario != "baseline" and seed in baseline_ops and seed in baseline_p95:
+            if not scenario.startswith("baseline") and seed in baseline_ops and seed in baseline_p95:
                 baseline_ops_median = median(list(baseline_ops[seed].values()))
                 baseline_p95_median = median(list(baseline_p95[seed].values()))
                 if baseline_ops_median is not None and baseline_p95_median is not None:
@@ -383,15 +401,18 @@ def make_paper_rows(rows: list[dict], statuses: dict[str, str]) -> list[dict]:
 
 
 def validate_dataset(
-    rows: list[dict], statuses: dict[str, str], expected_seed_count: int | None
+    rows: list[dict],
+    statuses: dict[str, str],
+    expected_seed_count: int | None,
+    required_scenarios: set[str],
 ) -> list[str]:
     errors: list[str] = []
     found = set(statuses)
-    if found != REQUIRED_SCENARIOS:
+    if found != required_scenarios:
         errors.append(
-            f"scenario set mismatch: expected {sorted(REQUIRED_SCENARIOS)}, found {sorted(found)}"
+            f"scenario set mismatch: expected {sorted(required_scenarios)}, found {sorted(found)}"
         )
-    for scenario in sorted(REQUIRED_SCENARIOS):
+    for scenario in sorted(required_scenarios):
         seeds = {row["seed"] for row in rows if row["scenario"] == scenario}
         if expected_seed_count is not None and len(seeds) != expected_seed_count:
             errors.append(f"{scenario}: expected {expected_seed_count} seeds, found {len(seeds)}")
@@ -417,18 +438,18 @@ def validate_dataset(
         }
         if fault_counts["AddFailureInjectionWorkload"]:
             errors.append(f"{scenario}: unexpected automatic failure workload detected")
-        if scenario == "baseline" and (
+        if scenario.startswith("baseline") and (
             fault_counts["CloggingPair"] or fault_counts["SetDiskFailure"]
         ):
-            errors.append("baseline: fault events detected")
+            errors.append(f"{scenario}: fault events detected")
         if scenario.startswith("network_clog") and not fault_counts["CloggingPair"]:
             errors.append(f"{scenario}: no CloggingPair events detected")
         if scenario.startswith("network_clog") and fault_counts["SetDiskFailure"]:
             errors.append(f"{scenario}: unexpected disk failure events detected")
-        if scenario == "slow_storage" and not fault_counts["SetDiskFailure"]:
-            errors.append("slow_storage: no SetDiskFailure events detected")
-        if scenario == "slow_storage" and fault_counts["CloggingPair"]:
-            errors.append("slow_storage: unexpected network clog events detected")
+        if scenario.startswith("slow_storage") and not fault_counts["SetDiskFailure"]:
+            errors.append(f"{scenario}: no SetDiskFailure events detected")
+        if scenario.startswith("slow_storage") and fault_counts["CloggingPair"]:
+            errors.append(f"{scenario}: unexpected network clog events detected")
     return errors
 
 
@@ -566,7 +587,7 @@ def build_paper_evidence(rows: list[dict], statuses: dict[str, str]) -> str:
         recoveries = [row["recovery_seconds"] for row in scenario_rows if row["recovery_seconds"] is not None]
         recovery = (
             "n/a"
-            if scenario == "baseline"
+            if scenario.startswith("baseline")
             else (
                 f"{fmt(median(recoveries))}s ({len(recoveries)}/{len(scenario_rows)})"
                 if recoveries
@@ -620,6 +641,10 @@ def main() -> None:
     parser.add_argument("--results", type=Path, required=True)
     parser.add_argument("--output", type=Path, required=True)
     parser.add_argument("--expected-seeds", type=int)
+    parser.add_argument(
+        "--expected-scenarios",
+        help="Comma-separated scenario names; defaults to the four smoke scenarios",
+    )
     parser.add_argument("--strict", action="store_true")
     args = parser.parse_args()
     args.output.mkdir(parents=True, exist_ok=True)
@@ -665,7 +690,14 @@ def main() -> None:
             writer.writeheader()
             writer.writerows(paper_rows)
 
-    validation_errors = validate_dataset(rows, statuses, args.expected_seeds)
+    required_scenarios = (
+        {item for item in args.expected_scenarios.split(",") if item}
+        if args.expected_scenarios
+        else REQUIRED_SCENARIOS
+    )
+    validation_errors = validate_dataset(
+        rows, statuses, args.expected_seeds, required_scenarios
+    )
     validation_lines = ["# Benchmark validity", ""]
     if validation_errors:
         validation_lines.extend(["**FAIL**", ""] + [f"- {error}" for error in validation_errors])

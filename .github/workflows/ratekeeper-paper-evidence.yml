@@ -1,0 +1,333 @@
+name: Ratekeeper Paper Evidence
+
+on:
+  workflow_dispatch:
+    inputs:
+      seeds:
+        description: "Paired deterministic seeds (30 are provided by default)"
+        required: true
+        default: "101 202 303 404 505 606 707 808 909 1010 1111 1212 1313 1414 1515 1616 1717 1818 1919 2020 2121 2222 2323 2424 2525 2626 2727 2828 2929 3030"
+      build_jobs:
+        description: "Parallel Ninja jobs; choose 1 if the build is OOM-killed"
+        required: true
+        type: choice
+        options:
+          - "2"
+          - "1"
+        default: "2"
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ratekeeper-paper-${{ github.ref }}
+  cancel-in-progress: false
+
+env:
+  BUILD_TYPE: Release
+  BUILD_IMAGE_TAG: docker.io/foundationdb/build:rockylinux9-latest
+  SEEDS: ${{ inputs.seeds }}
+  SCENARIOS: baseline_low,baseline,baseline_high,network_clog_mild_low,network_clog_mild,network_clog_mild_high,network_clog_severe_low,network_clog_severe,network_clog_severe_high,slow_storage
+
+jobs:
+  build:
+    name: Build source once
+    runs-on: ubuntu-latest
+    timeout-minutes: 300
+    outputs:
+      build_image: ${{ steps.image.outputs.ref }}
+
+    steps:
+      - name: Free disk space
+        run: |
+          set -euo pipefail
+          sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc /opt/hostedtoolcache
+          sudo docker image prune --all --force || true
+          df -h
+
+      - name: Checkout source
+        uses: actions/checkout@v4
+
+      - name: Apply delayed-fault research instrumentation
+        run: |
+          set -euo pipefail
+          patch_file=contrib/ratekeeper_benchmarks/patches/random-clogging-start-delay.patch
+          git apply --check "$patch_file"
+          git apply "$patch_file"
+
+      - name: Validate seed list
+        run: |
+          set -euo pipefail
+          seed_count=0
+          for seed in $SEEDS; do
+            [[ "$seed" =~ ^[0-9]+$ ]] || { echo "Invalid seed: $seed" >&2; exit 2; }
+            seed_count=$((seed_count + 1))
+          done
+          [[ "$seed_count" -ge 20 ]] || {
+            echo "Paper evidence requires at least 20 paired seeds; found $seed_count" >&2
+            exit 2
+          }
+
+      - name: Prepare build and cache directories
+        run: mkdir -p build .ccache paper-build
+
+      - name: Restore compiler cache
+        uses: actions/cache/restore@v4
+        with:
+          path: .ccache
+          key: fdb-paper-ccache-${{ runner.os }}-${{ env.BUILD_TYPE }}-${{ github.run_id }}
+          restore-keys: |
+            fdb-paper-ccache-${{ runner.os }}-${{ env.BUILD_TYPE }}-
+            fdb-ccache-${{ runner.os }}-${{ env.BUILD_TYPE }}-
+
+      - name: Build fdbserver from checked-out source
+        env:
+          BUILD_JOBS: ${{ inputs.build_jobs }}
+        run: |
+          set -euo pipefail
+          docker run --rm \
+            -v "${{ github.workspace }}:/workspace" \
+            -v "${{ github.workspace }}/.ccache:/root/.ccache" \
+            -e BUILD_TYPE="$BUILD_TYPE" \
+            -e BUILD_JOBS="$BUILD_JOBS" \
+            -e CCACHE_DIR=/root/.ccache \
+            -e CCACHE_MAXSIZE=3G \
+            -e CCACHE_BASEDIR=/workspace \
+            -e CCACHE_NOHASHDIR=true \
+            -e GOFLAGS=-buildvcs=false \
+            -w /workspace/build \
+            "$BUILD_IMAGE_TAG" \
+            bash -euo pipefail -c '
+              source /opt/rh/gcc-toolset-13/enable || true
+              git config --global --add safe.directory /workspace
+              cmake -G Ninja \
+                -D CMAKE_BUILD_TYPE="$BUILD_TYPE" \
+                -D BUILD_SWIFT_BINDING=OFF \
+                -D BUILD_TESTING=OFF \
+                -D ENABLE_UNIT_TESTS=OFF \
+                -D USE_CCACHE=ON \
+                -D USE_LD=LLD \
+                -D USE_LIBCXX=1 \
+                -D USE_WERROR=OFF \
+                ..
+              ninja -j"$BUILD_JOBS" fdbserver
+              test -x bin/fdbserver
+              bin/fdbserver --version
+              ccache --show-stats || true
+            '
+
+      - name: Resolve immutable build image
+        id: image
+        run: |
+          set -euo pipefail
+          image_ref=$(docker image inspect --format '{{index .RepoDigests 0}}' "$BUILD_IMAGE_TAG")
+          [[ "$image_ref" == *@sha256:* ]] || { echo "No immutable image digest" >&2; exit 2; }
+          echo "ref=$image_ref" >> "$GITHUB_OUTPUT"
+
+      - name: Create reproducibility manifest and binary archive
+        env:
+          BUILD_IMAGE: ${{ steps.image.outputs.ref }}
+        run: |
+          set -euo pipefail
+          binary_sha=$(sha256sum build/bin/fdbserver | cut -d' ' -f1)
+          binary_version=$(build/bin/fdbserver --version | tr '\n' ' ')
+          scenario_sha=$(find contrib/ratekeeper_benchmarks/scenarios -name '*.toml' -type f -print0 | sort -z | xargs -0 sha256sum)
+          patch_sha=$(sha256sum contrib/ratekeeper_benchmarks/patches/random-clogging-start-delay.patch)
+          python3 - "$binary_sha" "$binary_version" "$scenario_sha" "$patch_sha" <<'PY'
+          import json, os, platform, sys
+          manifest = {
+              "git_commit": os.environ["GITHUB_SHA"],
+              "git_ref": os.environ["GITHUB_REF"],
+              "workflow_run_id": os.environ["GITHUB_RUN_ID"],
+              "workflow_run_attempt": os.environ["GITHUB_RUN_ATTEMPT"],
+              "seeds": [int(seed) for seed in os.environ["SEEDS"].split()],
+              "scenarios": os.environ["SCENARIOS"].split(","),
+              "build_type": os.environ["BUILD_TYPE"],
+              "build_image": os.environ["BUILD_IMAGE"],
+              "fdbserver_sha256": sys.argv[1],
+              "fdbserver_version": sys.argv[2].strip(),
+              "scenario_sha256": sys.argv[3].splitlines(),
+              "instrumentation_patch_sha256": sys.argv[4],
+              "runner_platform": platform.platform(),
+          }
+          with open("paper-build/manifest.json", "w") as handle:
+              json.dump(manifest, handle, indent=2)
+              handle.write("\n")
+          PY
+          tar -C build -czf paper-build/fdbserver.tar.gz bin/fdbserver
+
+      - name: Save compiler cache
+        if: always()
+        run: sudo chown -R "$(id -u):$(id -g)" .ccache || true
+
+      - name: Store compiler cache
+        if: always()
+        uses: actions/cache/save@v4
+        with:
+          path: .ccache
+          key: fdb-paper-ccache-${{ runner.os }}-${{ env.BUILD_TYPE }}-${{ github.run_id }}
+
+      - name: Upload source-built binary and manifest
+        uses: actions/upload-artifact@v4
+        with:
+          name: ratekeeper-paper-build-${{ github.run_id }}-${{ github.run_attempt }}
+          path: paper-build/*
+          if-no-files-found: error
+          retention-days: 90
+
+  benchmark:
+    name: ${{ matrix.scenario }}
+    needs: build
+    runs-on: ubuntu-latest
+    timeout-minutes: 240
+    strategy:
+      fail-fast: false
+      max-parallel: 6
+      matrix:
+        scenario:
+          - baseline_low
+          - baseline
+          - baseline_high
+          - network_clog_mild_low
+          - network_clog_mild
+          - network_clog_mild_high
+          - network_clog_severe_low
+          - network_clog_severe
+          - network_clog_severe_high
+          - slow_storage
+
+    steps:
+      - name: Checkout experiment definitions
+        uses: actions/checkout@v4
+
+      - name: Download source-built fdbserver
+        uses: actions/download-artifact@v4
+        with:
+          name: ratekeeper-paper-build-${{ github.run_id }}-${{ github.run_attempt }}
+          path: paper-build
+
+      - name: Restore executable
+        run: |
+          set -euo pipefail
+          tar -xzf paper-build/fdbserver.tar.gz
+          chmod +x build/bin/fdbserver
+          test -x build/bin/fdbserver
+
+      - name: Run paired deterministic seeds
+        env:
+          BUILD_IMAGE: ${{ needs.build.outputs.build_image }}
+          SCENARIO: ${{ matrix.scenario }}
+        run: |
+          set -uo pipefail
+          test_file="contrib/ratekeeper_benchmarks/scenarios/${SCENARIO}.toml"
+          test -f "$test_file" || { echo "Missing $test_file" >&2; exit 2; }
+          result=0
+          for seed in $SEEDS; do
+            host_run_dir="${{ github.workspace }}/benchmark-results/${SCENARIO}/seed-${seed}"
+            container_run_dir="/workspace/benchmark-results/${SCENARIO}/seed-${seed}"
+            mkdir -p "$host_run_dir"
+            echo "::group::${SCENARIO} seed=${seed}"
+            if docker run --rm \
+              -v "${{ github.workspace }}:/workspace" \
+              -w "$container_run_dir" \
+              "$BUILD_IMAGE" \
+              bash -euo pipefail -c \
+                "/workspace/build/bin/fdbserver -r simulation -f /workspace/$test_file --seed $seed --buggify off 2>&1 | tee simulation.log"; then
+              echo PASS > "$host_run_dir/status.txt"
+            else
+              code=$?
+              echo "FAIL ($code)" > "$host_run_dir/status.txt"
+              result=1
+            fi
+            echo "::endgroup::"
+          done
+          exit "$result"
+
+      - name: Package scenario evidence
+        if: always()
+        env:
+          SCENARIO: ${{ matrix.scenario }}
+        run: |
+          set -euo pipefail
+          sudo chown -R "$(id -u):$(id -g)" benchmark-results || true
+          mkdir -p scenario-archive
+          tar -C benchmark-results -czf "scenario-archive/${SCENARIO}.tar.gz" "$SCENARIO"
+
+      - name: Upload scenario evidence
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: ratekeeper-paper-raw-${{ matrix.scenario }}-${{ github.run_id }}-${{ github.run_attempt }}
+          path: scenario-archive/*.tar.gz
+          if-no-files-found: error
+          retention-days: 90
+
+  analyze:
+    name: Validate and analyze paired evidence
+    if: always()
+    needs:
+      - build
+      - benchmark
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+
+    steps:
+      - name: Checkout analysis code
+        uses: actions/checkout@v4
+
+      - name: Download build manifest
+        uses: actions/download-artifact@v4
+        with:
+          name: ratekeeper-paper-build-${{ github.run_id }}-${{ github.run_attempt }}
+          path: paper-build
+
+      - name: Download all scenario archives
+        uses: actions/download-artifact@v4
+        with:
+          pattern: ratekeeper-paper-raw-*-${{ github.run_id }}-${{ github.run_attempt }}
+          path: raw-archives
+          merge-multiple: true
+
+      - name: Extract evidence
+        run: |
+          set -euo pipefail
+          mkdir -p benchmark-results
+          archive_count=0
+          for archive in raw-archives/*.tar.gz; do
+            tar -xzf "$archive" -C benchmark-results
+            archive_count=$((archive_count + 1))
+          done
+          [[ "$archive_count" -eq 10 ]] || {
+            echo "Expected 10 scenario archives; found $archive_count" >&2
+            exit 2
+          }
+          cp paper-build/manifest.json benchmark-results/manifest.json
+
+      - name: Validate measurements and create paper tables
+        run: |
+          set -euo pipefail
+          expected_seeds=$(wc -w <<< "$SEEDS" | tr -d ' ')
+          python3 contrib/ratekeeper_benchmarks/parse_results.py \
+            --results benchmark-results \
+            --output benchmark-results/summary \
+            --expected-seeds "$expected_seeds" \
+            --expected-scenarios "$SCENARIOS" \
+            --strict
+          python3 contrib/ratekeeper_benchmarks/analyze_hypothesis.py \
+            --metrics benchmark-results/summary/metrics.csv \
+            --output benchmark-results/summary
+
+          cat benchmark-results/summary/evidence.md >> "$GITHUB_STEP_SUMMARY"
+          cat benchmark-results/summary/validity.md >> "$GITHUB_STEP_SUMMARY"
+          cat benchmark-results/summary/hypothesis.md >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Upload consolidated paper dataset
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: ratekeeper-paper-dataset-${{ github.run_id }}-${{ github.run_attempt }}
+          path: |
+            benchmark-results/manifest.json
+            benchmark-results/summary/**
+          if-no-files-found: error
+          retention-days: 90
