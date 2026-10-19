@@ -1078,6 +1078,13 @@ void ServerKnobs::initialize(Randomize randomize, ClientKnobs* clientKnobs, IsSi
 	init( RATEKEEPER_MAX_RATE,                                   1e9 );
 	init( RATEKEEPER_BATCH_MIN_RATE,                             0.0 );
 	init( RATEKEEPER_BATCH_MAX_RATE,                             1e9 );
+	init( LATENCY_AWARE_THROTTLING_ENABLED,                     false );
+	init( TARGET_GRV_LATENCY,                                   0.020 );
+	init( LATENCY_DEGRADATION_SMOOTHING,                          2.0 );
+	init( LATENCY_REDUCTION_FACTOR,                              0.90 );
+	init( LATENCY_INCREASE_FACTOR,                               1.02 );
+	init( LATENCY_RECOVERY_THRESHOLD,                            0.80 );
+	init( LATENCY_MIN_TPS_LIMIT,                                100.0 );
 
 	bool smallStorageTarget = randomize && buggify();
 	init( TARGET_BYTES_PER_STORAGE_SERVER,                    1000e6 ); if( smallStorageTarget ) TARGET_BYTES_PER_STORAGE_SERVER = 3000e3;

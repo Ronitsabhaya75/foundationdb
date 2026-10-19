@@ -258,6 +258,8 @@ public:
 	              bool skipTraceOnSilentInterval = false);
 	void addMeasurement(double measurement);
 	void addMeasurementPair(double measurement, LatencySample& other);
+	double percentile(double p) { return sketch.percentile(p); }
+	int64_t getPopulationSize() const { return sketch.getPopulationSize(); }
 
 private:
 	std::string name;

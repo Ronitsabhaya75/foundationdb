@@ -98,6 +98,9 @@ struct GetRateInfoRequest {
 	TransactionTagMap<uint64_t> throttledTagCounts;
 	bool detailed;
 	ReplyPromise<struct GetRateInfoReply> reply;
+	double grvMedianLatency{ 0.0 };
+	double grvP99Latency{ 0.0 };
+	int32_t grvQueueSize{ 0 };
 
 	GetRateInfoRequest() = default;
 	GetRateInfoRequest(UID const& requesterID,
@@ -105,10 +108,14 @@ struct GetRateInfoRequest {
 	                   int64_t batchReleasedTransactions,
 	                   Version version,
 	                   TransactionTagMap<uint64_t> throttledTagCounts,
-	                   bool detailed)
+	                   bool detailed,
+	                   double grvMedianLatency = 0.0,
+	                   double grvP99Latency = 0.0,
+	                   int32_t grvQueueSize = 0)
 	  : requesterID(requesterID), totalReleasedTransactions(totalReleasedTransactions),
 	    batchReleasedTransactions(batchReleasedTransactions), version(version), throttledTagCounts(throttledTagCounts),
-	    detailed(detailed) {}
+	    detailed(detailed), grvMedianLatency(grvMedianLatency), grvP99Latency(grvP99Latency),
+	    grvQueueSize(grvQueueSize) {}
 
 	template <class Ar>
 	void serialize(Ar& ar) {
@@ -119,7 +126,10 @@ struct GetRateInfoRequest {
 		           version,
 		           throttledTagCounts,
 		           detailed,
-		           reply);
+		           reply,
+		           grvMedianLatency,
+		           grvP99Latency,
+		           grvQueueSize);
 	}
 };
 

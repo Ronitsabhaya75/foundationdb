@@ -1,0 +1,372 @@
+name: Ratekeeper Simulation Benchmarks (120 Simulations)
+
+on:
+  push:
+    branches:
+      - "research/ratekeeper-fdb"
+    inputs:
+      simulation_scale:
+        description: "Simulation scale / seed count"
+        required: true
+        type: choice
+        options:
+          - "120 total simulations (30 seeds x 4 scenarios)"
+          - "480 total simulations (120 seeds x 4 scenarios)"
+          - "Custom seeds list"
+        default: "120 total simulations (30 seeds x 4 scenarios)"
+      custom_seeds:
+        description: "Custom space-separated list of integer seeds (used only if Custom seeds list is chosen)"
+        required: false
+        default: "101 202 303 404 505 606 707 808 909 1010 1111 1212 1313 1414 1515 1616 1717 1818 1919 2020 2121 2222 2323 2424 2525 2626 2727 2828 2929 3030"
+      enable_latency_controller:
+        description: "Enable latency-aware admission controller in Ratekeeper"
+        required: true
+        type: boolean
+        default: true
+      target_grv_latency:
+        description: "Target GRV latency in seconds (TARGET_GRV_LATENCY knob, default 0.020s = 20ms)"
+        required: false
+        default: "0.020"
+      build_jobs:
+        description: "Parallel Ninja build jobs"
+        required: true
+        type: choice
+        options:
+          - "2"
+          - "1"
+        default: "2"
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ratekeeper-sim-${{ github.ref }}
+  cancel-in-progress: false
+
+env:
+  BUILD_TYPE: Release
+  BUILD_IMAGE_TAG: docker.io/foundationdb/build:rockylinux9-latest
+  SCENARIOS: baseline,network_clog_mild,network_clog_severe,slow_storage
+
+jobs:
+  build:
+    name: Build fdbserver binary
+    runs-on: ubuntu-latest
+    timeout-minutes: 300
+    outputs:
+      build_image: ${{ steps.image.outputs.ref }}
+      seeds: ${{ steps.seeds.outputs.seeds }}
+      seed_count: ${{ steps.seeds.outputs.count }}
+
+    steps:
+      - name: Free disk space
+        run: |
+          set -euo pipefail
+          sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc /opt/hostedtoolcache
+          sudo docker image prune --all --force || true
+          df -h
+
+      - name: Checkout source
+        uses: actions/checkout@v4
+
+      - name: Determine simulation seed set
+        id: seeds
+        run: |
+          set -euo pipefail
+          scale="${{ inputs.simulation_scale }}"
+          if [[ "$scale" == "120 total simulations (30 seeds x 4 scenarios)" ]]; then
+            # 30 deterministic paired seeds across 4 scenarios = 120 simulations
+            seed_list="101 202 303 404 505 606 707 808 909 1010 1111 1212 1313 1414 1515 1616 1717 1818 1919 2020 2121 2222 2323 2424 2525 2626 2727 2828 2929 3030"
+          elif [[ "$scale" == "480 total simulations (120 seeds x 4 scenarios)" ]]; then
+            # 120 deterministic seeds across 4 scenarios = 480 simulations
+            seed_list=$(seq -s " " 101 100 12001)
+          else
+            seed_list="${{ inputs.custom_seeds }}"
+          fi
+          count=0
+          for s in $seed_list; do
+            [[ "$s" =~ ^[0-9]+$ ]] || { echo "Invalid seed: $s" >&2; exit 2; }
+            count=$((count + 1))
+          done
+          echo "Total seeds per scenario: $count (across 4 scenarios = $((count * 4)) simulations)"
+          echo "seeds=$seed_list" >> "$GITHUB_OUTPUT"
+          echo "count=$count" >> "$GITHUB_OUTPUT"
+
+      - name: Prepare build and cache directories
+        run: mkdir -p build .ccache sim-build
+
+      - name: Restore compiler cache
+        uses: actions/cache/restore@v4
+        with:
+          path: .ccache
+          key: fdb-sim-ccache-${{ runner.os }}-${{ env.BUILD_TYPE }}-${{ github.run_id }}
+          restore-keys: |
+            fdb-sim-ccache-${{ runner.os }}-${{ env.BUILD_TYPE }}-
+            fdb-paper-ccache-${{ runner.os }}-${{ env.BUILD_TYPE }}-
+            fdb-ccache-${{ runner.os }}-${{ env.BUILD_TYPE }}-
+
+      - name: Build fdbserver from checked-out source
+        env:
+          BUILD_JOBS: ${{ inputs.build_jobs }}
+        run: |
+          set -euo pipefail
+          docker run --rm \
+            -v "${{ github.workspace }}:/workspace" \
+            -v "${{ github.workspace }}/.ccache:/root/.ccache" \
+            -e BUILD_TYPE="$BUILD_TYPE" \
+            -e BUILD_JOBS="$BUILD_JOBS" \
+            -e CCACHE_DIR=/root/.ccache \
+            -e CCACHE_MAXSIZE=3G \
+            -e CCACHE_BASEDIR=/workspace \
+            -e CCACHE_NOHASHDIR=true \
+            -e GOFLAGS=-buildvcs=false \
+            -w /workspace/build \
+            "$BUILD_IMAGE_TAG" \
+            bash -euo pipefail -c '
+              source /opt/rh/gcc-toolset-13/enable || true
+              git config --global --add safe.directory /workspace
+              cmake -G Ninja \
+                -D CMAKE_BUILD_TYPE="$BUILD_TYPE" \
+                -D BUILD_SWIFT_BINDING=OFF \
+                -D BUILD_TESTING=OFF \
+                -D ENABLE_UNIT_TESTS=OFF \
+                -D USE_CCACHE=ON \
+                -D USE_LD=LLD \
+                -D USE_LIBCXX=1 \
+                -D USE_WERROR=OFF \
+                ..
+              ninja -j"$BUILD_JOBS" fdbserver
+              test -x bin/fdbserver
+              bin/fdbserver --version
+              ccache --show-stats || true
+            '
+
+      - name: Resolve immutable build image
+        id: image
+        run: |
+          set -euo pipefail
+          image_ref=$(docker image inspect --format '{{index .RepoDigests 0}}' "$BUILD_IMAGE_TAG")
+          [[ "$image_ref" == *@sha256:* ]] || { echo "No immutable image digest" >&2; exit 2; }
+          echo "ref=$image_ref" >> "$GITHUB_OUTPUT"
+
+      - name: Create build manifest and package binary
+        env:
+          BUILD_IMAGE: ${{ steps.image.outputs.ref }}
+          SEEDS: ${{ steps.seeds.outputs.seeds }}
+        run: |
+          set -euo pipefail
+          binary_sha=$(sha256sum build/bin/fdbserver | cut -d' ' -f1)
+          binary_version=$(build/bin/fdbserver --version | tr '\n' ' ')
+          scenario_sha=$(find contrib/ratekeeper_benchmarks/scenarios -name '*.toml' -type f -print0 | sort -z | xargs -0 sha256sum)
+          python3 - "$binary_sha" "$binary_version" "$scenario_sha" <<'PY'
+          import json, os, platform, sys
+          manifest = {
+              "git_commit": os.environ["GITHUB_SHA"],
+              "git_ref": os.environ["GITHUB_REF"],
+              "workflow_run_id": os.environ["GITHUB_RUN_ID"],
+              "workflow_run_attempt": os.environ["GITHUB_RUN_ATTEMPT"],
+              "seeds": [int(seed) for seed in os.environ["SEEDS"].split()],
+              "scenarios": os.environ["SCENARIOS"].split(","),
+              "build_type": os.environ["BUILD_TYPE"],
+              "build_image": os.environ["BUILD_IMAGE"],
+              "fdbserver_sha256": sys.argv[1],
+              "fdbserver_version": sys.argv[2].strip(),
+              "scenario_sha256": sys.argv[3].splitlines(),
+              "runner_platform": platform.platform(),
+          }
+          with open("sim-build/manifest.json", "w") as handle:
+              json.dump(manifest, handle, indent=2)
+              handle.write("\n")
+          PY
+          tar -C build -czf sim-build/fdbserver.tar.gz bin/fdbserver
+
+      - name: Save compiler cache
+        if: always()
+        run: sudo chown -R "$(id -u):$(id -g)" .ccache || true
+
+      - name: Store compiler cache
+        if: always()
+        uses: actions/cache/save@v4
+        with:
+          path: .ccache
+          key: fdb-sim-ccache-${{ runner.os }}-${{ env.BUILD_TYPE }}-${{ github.run_id }}
+
+      - name: Upload built fdbserver artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: ratekeeper-sim-build-${{ github.run_id }}-${{ github.run_attempt }}
+          path: sim-build/*
+          if-no-files-found: error
+          retention-days: 14
+
+  simulate:
+    name: ${{ matrix.scenario }}
+    needs: build
+    runs-on: ubuntu-latest
+    timeout-minutes: 240
+    strategy:
+      fail-fast: false
+      max-parallel: 4
+      matrix:
+        scenario:
+          - baseline
+          - network_clog_mild
+          - network_clog_severe
+          - slow_storage
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Download compiled fdbserver
+        uses: actions/download-artifact@v4
+        with:
+          name: ratekeeper-sim-build-${{ github.run_id }}-${{ github.run_attempt }}
+          path: sim-build
+
+      - name: Restore executable
+        run: |
+          set -euo pipefail
+          tar -xzf sim-build/fdbserver.tar.gz
+          chmod +x build/bin/fdbserver
+          test -x build/bin/fdbserver
+
+      - name: Run simulations for ${{ matrix.scenario }}
+        env:
+          BUILD_IMAGE: ${{ needs.build.outputs.build_image }}
+          SCENARIO: ${{ matrix.scenario }}
+          SEEDS: ${{ needs.build.outputs.seeds }}
+          ENABLE_LATENCY_CTRL: ${{ inputs.enable_latency_controller }}
+          TARGET_GRV_LATENCY: ${{ inputs.target_grv_latency }}
+        run: |
+          set -uo pipefail
+          test_file="contrib/ratekeeper_benchmarks/scenarios/${SCENARIO}.toml"
+          test -f "$test_file" || { echo "Missing $test_file" >&2; exit 2; }
+
+          extra_knobs=""
+          if [[ "$ENABLE_LATENCY_CTRL" == "true" ]]; then
+            extra_knobs="--knob_latency_aware_throttling_enabled=true --knob_target_grv_latency=${TARGET_GRV_LATENCY}"
+          fi
+
+          echo "Running $SCENARIO with extra knobs: $extra_knobs"
+          result=0
+          for seed in $SEEDS; do
+            host_run_dir="${{ github.workspace }}/benchmark-results/${SCENARIO}/seed-${seed}"
+            container_run_dir="/workspace/benchmark-results/${SCENARIO}/seed-${seed}"
+            mkdir -p "$host_run_dir"
+            echo "::group::${SCENARIO} seed=${seed}"
+            if docker run --rm \
+              -v "${{ github.workspace }}:/workspace" \
+              -w "$container_run_dir" \
+              "$BUILD_IMAGE" \
+              bash -euo pipefail -c \
+                "/workspace/build/bin/fdbserver -r simulation -f /workspace/$test_file --seed $seed --buggify off $extra_knobs 2>&1 | tee simulation.log"; then
+              echo PASS > "$host_run_dir/status.txt"
+            else
+              code=$?
+              echo "FAIL ($code)" > "$host_run_dir/status.txt"
+              result=1
+            fi
+            echo "::endgroup::"
+          done
+          exit "$result"
+
+      - name: Package scenario artifacts
+        if: always()
+        env:
+          SCENARIO: ${{ matrix.scenario }}
+        run: |
+          set -euo pipefail
+          sudo chown -R "$(id -u):$(id -g)" benchmark-results || true
+          mkdir -p scenario-archive
+          tar -C benchmark-results -czf "scenario-archive/${SCENARIO}.tar.gz" "$SCENARIO"
+
+      - name: Upload scenario raw evidence
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: ratekeeper-sim-raw-${{ matrix.scenario }}-${{ github.run_id }}-${{ github.run_attempt }}
+          path: scenario-archive/*.tar.gz
+          if-no-files-found: error
+          retention-days: 14
+
+  analyze:
+    name: Analyze 120 Simulation Results
+    if: always()
+    needs:
+      - build
+      - simulate
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Download build manifest
+        uses: actions/download-artifact@v4
+        with:
+          name: ratekeeper-sim-build-${{ github.run_id }}-${{ github.run_attempt }}
+          path: sim-build
+
+      - name: Download all scenario raw archives
+        uses: actions/download-artifact@v4
+        with:
+          pattern: ratekeeper-sim-raw-*-${{ github.run_id }}-${{ github.run_attempt }}
+          path: raw-archives
+          merge-multiple: true
+
+      - name: Extract evidence
+        run: |
+          set -euo pipefail
+          mkdir -p benchmark-results
+          archive_count=0
+          for archive in raw-archives/*.tar.gz; do
+            tar -xzf "$archive" -C benchmark-results
+            archive_count=$((archive_count + 1))
+          done
+          echo "Extracted $archive_count scenario archives."
+          [[ "$archive_count" -eq 4 ]] || {
+            echo "Expected 4 scenario archives; found $archive_count" >&2
+            exit 2
+          }
+          cp sim-build/manifest.json benchmark-results/manifest.json
+
+      - name: Parse results and generate analysis summary
+        env:
+          EXPECTED_SEEDS: ${{ needs.build.outputs.seed_count }}
+        run: |
+          set -euo pipefail
+          python3 contrib/ratekeeper_benchmarks/parse_results.py \
+            --results benchmark-results \
+            --output benchmark-results/summary \
+            --expected-seeds "$EXPECTED_SEEDS" \
+            --expected-scenarios "$SCENARIOS" \
+            --strict
+          python3 contrib/ratekeeper_benchmarks/analyze_hypothesis.py \
+            --metrics benchmark-results/summary/metrics.csv \
+            --output benchmark-results/summary
+
+          echo "## Ratekeeper Benchmark Simulation Results" >> "$GITHUB_STEP_SUMMARY"
+          echo "Tested 4 scenarios (baseline, network_clog_mild, network_clog_severe, slow_storage) across $EXPECTED_SEEDS seeds each ($((EXPECTED_SEEDS * 4)) total simulations)." >> "$GITHUB_STEP_SUMMARY"
+          echo "" >> "$GITHUB_STEP_SUMMARY"
+          if [[ -f benchmark-results/summary/evidence.md ]]; then
+            cat benchmark-results/summary/evidence.md >> "$GITHUB_STEP_SUMMARY"
+          fi
+          if [[ -f benchmark-results/summary/validity.md ]]; then
+            cat benchmark-results/summary/validity.md >> "$GITHUB_STEP_SUMMARY"
+          fi
+          if [[ -f benchmark-results/summary/hypothesis.md ]]; then
+            cat benchmark-results/summary/hypothesis.md >> "$GITHUB_STEP_SUMMARY"
+          fi
+
+      - name: Upload consolidated summary and dataset
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: ratekeeper-sim-summary-${{ github.run_id }}-${{ github.run_attempt }}
+          path: |
+            benchmark-results/manifest.json
+            benchmark-results/summary/**
+          if-no-files-found: error
+          retention-days: 30
