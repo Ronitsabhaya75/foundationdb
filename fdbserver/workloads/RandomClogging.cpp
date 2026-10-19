@@ -29,6 +29,7 @@ struct RandomCloggingWorkload : FailureInjectionWorkload {
 
 	bool enabled;
 	double testDuration = 10.0;
+	double startDelay = 0.0;
 	double scale = 1.0, clogginess = 1.0;
 	int swizzleClog = 0;
 	bool iterate = false;
@@ -39,6 +40,7 @@ struct RandomCloggingWorkload : FailureInjectionWorkload {
 	explicit RandomCloggingWorkload(WorkloadContext const& wcx) : FailureInjectionWorkload(wcx) {
 		enabled = !clientId; // only do this on the "first" client
 		testDuration = getOption(options, "testDuration"_sr, testDuration);
+		startDelay = getOption(options, "startDelay"_sr, startDelay);
 		scale = getOption(options, "scale"_sr, scale);
 		clogginess = getOption(options, "clogginess"_sr, clogginess);
 		swizzleClog = getOption(options, "swizzle"_sr, swizzleClog);
@@ -69,6 +71,7 @@ struct RandomCloggingWorkload : FailureInjectionWorkload {
 	void getMetrics(std::vector<PerfMetric>& m) override {}
 
 	Future<Void> startImpl() {
+		co_await delay(startDelay);
 		Future<Void> done = delay(maxRunDuration);
 		while (true) {
 			co_await (done ||

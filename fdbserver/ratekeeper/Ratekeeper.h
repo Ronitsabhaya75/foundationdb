@@ -127,6 +127,7 @@ struct RatekeeperLimits {
 	int64_t durabilityLagTargetVersions;
 	int64_t lastDurabilityLag;
 	double durabilityLagLimit;
+	double latencyLimit;
 
 	TransactionPriority priority;
 	std::string context;
@@ -152,6 +153,10 @@ class Ratekeeper {
 		double lastUpdateTime{ 0.0 };
 		double lastTagPushTime{ 0.0 };
 		Version version{ 0 };
+
+		double grvMedianLatency{ 0.0 };
+		double grvP99Latency{ 0.0 };
+		int32_t grvQueueSize{ 0 };
 	};
 
 	struct VersionInfo {
@@ -173,6 +178,7 @@ class Ratekeeper {
 
 	std::map<UID, Ratekeeper::GrvProxyInfo> grvProxyInfo;
 	Smoother smoothReleasedTransactions, smoothBatchReleasedTransactions, smoothTotalDurableBytes;
+	Smoother smoothWorstGrvP99Latency;
 	HealthMetrics healthMetrics;
 	DatabaseConfiguration configuration;
 	PromiseStream<Future<Void>> addActor;
@@ -216,6 +222,7 @@ class Ratekeeper {
 	Future<Void> configurationMonitor();
 	void updateCommitCostEstimation(UIDTransactionTagMap<TransactionCommitCostEstimation> const& costEstimation);
 	void updateRate(RatekeeperLimits* limits);
+	double computeLatencyLimit(RatekeeperLimits* limits, UID& worstLatencyProxyID);
 	Future<Void> refreshStorageServerCommitCosts();
 	Future<Void> monitorServerListChange(PromiseStream<std::pair<UID, Optional<StorageServerInterface>>> serverChanges);
 	Future<Void> trackStorageServerQueueInfo(StorageServerInterface);

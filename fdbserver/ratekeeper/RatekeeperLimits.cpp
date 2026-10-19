@@ -37,5 +37,6 @@ RatekeeperLimits::RatekeeperLimits(TransactionPriority priority,
                                 SERVER_KNOBS->MAX_READ_TRANSACTION_LIFE_VERSIONS), // The read transaction life versions
                                                                                    // are expected to not
     // be durable on the storage servers
-    lastDurabilityLag(0), durabilityLagLimit(std::numeric_limits<double>::infinity()), priority(priority),
-    context(context), rkUpdateEventCacheHolder(makeReference<EventCacheHolder>("RkUpdate" + context)) {}
+    lastDurabilityLag(0), durabilityLagLimit(std::numeric_limits<double>::infinity()),
+    latencyLimit(std::numeric_limits<double>::infinity()), priority(priority), context(context),
+    rkUpdateEventCacheHolder(makeReference<EventCacheHolder>("RkUpdate" + context)) {}

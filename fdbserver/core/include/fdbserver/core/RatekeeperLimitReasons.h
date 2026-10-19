@@ -34,6 +34,7 @@ enum limitReason_t {
 	log_server_min_free_space_ratio,
 	storage_server_durability_lag,
 	storage_server_list_fetch_failed,
+	latency_degradation,
 	limitReason_t_end
 };
 

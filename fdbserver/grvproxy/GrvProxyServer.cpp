@@ -454,6 +454,14 @@ Future<Void> getRate(UID myID,
 			nextRequestTimer = Never();
 			bool detailed = now() - lastDetailedReply > SERVER_KNOBS->DETAILED_METRIC_UPDATE_RATE;
 
+			double grvMedianLatency = 0.0;
+			double grvP99Latency = 0.0;
+			if (stats->grvLatencySample.getPopulationSize() > 0) {
+				grvMedianLatency = stats->grvLatencySample.percentile(0.5);
+				grvP99Latency = stats->grvLatencySample.percentile(0.99);
+			}
+			int32_t grvQueueSize = stats->defaultGRVQueueSize;
+
 			// Receive ratekeeper replies at socket priority so incoming GRVs cannot starve rate-lease updates.
 			reply = brokenPromiseToNever(
 			    db->get().ratekeeper.get().getRateInfo.getReply(GetRateInfoRequest(myID,
@@ -461,7 +469,10 @@ Future<Void> getRate(UID myID,
 			                                                                       *inBatchTransactionCount,
 			                                                                       proxyData->version,
 			                                                                       *transactionTagCounter,
-			                                                                       detailed),
+			                                                                       detailed,
+			                                                                       grvMedianLatency,
+			                                                                       grvP99Latency,
+			                                                                       grvQueueSize),
 			                                                    TaskPriority::ReadSocket));
 			transactionTagCounter->clear();
 			expectingDetailedReply = detailed;

@@ -377,6 +377,9 @@ Future<Void> Ratekeeper::handleGetRateInfoReqs(RatekeeperInterface rkInterf,
 		p.totalTransactions = req.totalReleasedTransactions;
 		p.batchTransactions = req.batchReleasedTransactions;
 		p.version = req.version;
+		p.grvMedianLatency = req.grvMedianLatency;
+		p.grvP99Latency = req.grvP99Latency;
+		p.grvQueueSize = req.grvQueueSize;
 		maxVersion = std::max(maxVersion, req.version);
 
 		if (*recoveryVersion == std::numeric_limits<Version>::max() && version_recovery.contains(*recoveryVersion)) {
@@ -588,7 +591,8 @@ Future<Void> Ratekeeper::monitorThrottlingChanges() {
 Ratekeeper::Ratekeeper(UID id, Database db)
   : id(id), db(db), smoothReleasedTransactions(SERVER_KNOBS->SMOOTHING_AMOUNT),
     smoothBatchReleasedTransactions(SERVER_KNOBS->SMOOTHING_AMOUNT),
-    smoothTotalDurableBytes(SERVER_KNOBS->SLOW_SMOOTHING_AMOUNT), actualTpsMetric("Ratekeeper.ActualTPS"_sr),
+    smoothTotalDurableBytes(SERVER_KNOBS->SLOW_SMOOTHING_AMOUNT),
+    smoothWorstGrvP99Latency(SERVER_KNOBS->LATENCY_DEGRADATION_SMOOTHING), actualTpsMetric("Ratekeeper.ActualTPS"_sr),
     lastWarning(0), lastSSListFetchedTimestamp(now()), normalLimits(TransactionPriority::DEFAULT,
                                                                     "",
                                                                     SERVER_KNOBS->TARGET_BYTES_PER_STORAGE_SERVER,
@@ -634,6 +638,53 @@ static std::string getIgnoredZonesReasons(
 		ignoredZoneReasons += "] ";
 	}
 	return !ignoredZoneReasons.empty() ? ignoredZoneReasons : "None";
+}
+
+double Ratekeeper::computeLatencyLimit(RatekeeperLimits* limits, UID& worstLatencyProxyID) {
+	double worstP99Latency = 0.0;
+	worstLatencyProxyID = UID();
+
+	for (const auto& [proxyID, pInfo] : grvProxyInfo) {
+		if (pInfo.grvP99Latency > worstP99Latency) {
+			worstP99Latency = pInfo.grvP99Latency;
+			worstLatencyProxyID = proxyID;
+		}
+	}
+
+	if (limits->priority == TransactionPriority::DEFAULT) {
+		smoothWorstGrvP99Latency.setTotal(worstP99Latency);
+	}
+	double observedP99 = smoothWorstGrvP99Latency.smoothTotal();
+
+	if (observedP99 > SERVER_KNOBS->TARGET_GRV_LATENCY) {
+		if (limits->latencyLimit == std::numeric_limits<double>::infinity()) {
+			double actualTps = smoothReleasedTransactions.smoothRate();
+			limits->latencyLimit = std::max(actualTps, SERVER_KNOBS->LATENCY_MIN_TPS_LIMIT);
+		}
+		double ratio = SERVER_KNOBS->TARGET_GRV_LATENCY / observedP99;
+		limits->latencyLimit *= std::min(ratio, 1.0) * SERVER_KNOBS->LATENCY_REDUCTION_FACTOR;
+		limits->latencyLimit = std::max(limits->latencyLimit, SERVER_KNOBS->LATENCY_MIN_TPS_LIMIT);
+	} else if (limits->latencyLimit != std::numeric_limits<double>::infinity()) {
+		if (observedP99 < SERVER_KNOBS->TARGET_GRV_LATENCY * SERVER_KNOBS->LATENCY_RECOVERY_THRESHOLD) {
+			limits->latencyLimit *= SERVER_KNOBS->LATENCY_INCREASE_FACTOR;
+			if (limits->latencyLimit >= SERVER_KNOBS->RATEKEEPER_DEFAULT_LIMIT ||
+			    limits->latencyLimit >= limits->tpsLimit) {
+				limits->latencyLimit = std::numeric_limits<double>::infinity();
+			}
+		}
+	}
+
+	if (deterministicRandom()->random01() < 0.1) {
+		TraceEvent("RkLatencyUpdate", id)
+		    .detail("Context", limits->context)
+		    .detail("SmoothedP99Latency", observedP99)
+		    .detail("WorstProxyLatency", worstP99Latency)
+		    .detail("LatencyLimit", limits->latencyLimit)
+		    .detail("QueueLimit", limits->tpsLimit)
+		    .detail("WorstProxyID", worstLatencyProxyID);
+	}
+
+	return limits->latencyLimit;
 }
 
 void Ratekeeper::updateRate(RatekeeperLimits* limits) {
@@ -1103,6 +1154,17 @@ void Ratekeeper::updateRate(RatekeeperLimits* limits) {
 		limits->tpsLimit = SERVER_KNOBS->RATEKEEPER_DEFAULT_LIMIT;
 	}
 
+	if (SERVER_KNOBS->LATENCY_AWARE_THROTTLING_ENABLED &&
+	    limitReason != limitReason_t::storage_server_list_fetch_failed) {
+		UID worstLatencyProxyID = UID();
+		double latLimit = computeLatencyLimit(limits, worstLatencyProxyID);
+		if (latLimit < limits->tpsLimit) {
+			limits->tpsLimit = latLimit;
+			limitReason = limitReason_t::latency_degradation;
+			reasonID = worstLatencyProxyID;
+		}
+	}
+
 	limits->tpsLimitMetric = std::min(limits->tpsLimit, 1e6);
 	limits->reasonMetric = limitReason;
 
@@ -1136,6 +1198,8 @@ void Ratekeeper::updateRate(RatekeeperLimits* limits) {
 		    .detail("LimitingStorageServerVersionLag", limitingVersionLag)
 		    .detail("WorstStorageServerDurabilityLag", worstDurabilityLag)
 		    .detail("LimitingStorageServerDurabilityLag", limitingDurabilityLag)
+		    .detail("LatencyLimit", limits->latencyLimit)
+		    .detail("SmoothedP99GRVLatency", smoothWorstGrvP99Latency.smoothTotal())
 		    .detail("IgnoredZonesReasons", getIgnoredZonesReasons(ignoredMachines, zoneReasons))
 		    .detail("TagsAutoThrottled", tagThrottler->autoThrottleCount())
 		    .detail("TagsAutoThrottledBusyRead", tagThrottler->busyReadTagCount())

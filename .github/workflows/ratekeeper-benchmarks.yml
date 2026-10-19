@@ -1,0 +1,318 @@
+name: Ratekeeper Degradation Benchmarks
+
+on:
+  workflow_dispatch:
+    inputs:
+      profile:
+        description: "Run size: smoke validates CI; paper collects a larger paired sample"
+        required: true
+        type: choice
+        options:
+          - smoke
+          - paper
+        default: smoke
+      seeds:
+        description: "Optional space-separated seeds (overrides the selected profile)"
+        required: false
+        default: ""
+      build_jobs:
+        description: "Parallel Ninja jobs (use 1 if the runner is OOM-killed)"
+        required: false
+        default: "2"
+      resume_run_id:
+        description: "Optional prior workflow run whose artifact should be resumed"
+        required: false
+        default: ""
+      resume_run_attempt:
+        description: "Attempt number of the prior workflow run"
+        required: false
+        default: "1"
+  pull_request:
+    branches:
+      - main
+    paths:
+      - ".github/workflows/ratekeeper-benchmarks.yml"
+      - "contrib/ratekeeper_benchmarks/**"
+      - "contrib/ratekeeper_benchmarks/scenarios/**"
+      - "fdbserver/ratekeeper/**"
+      - "fdbserver/grvproxy/**"
+      - "fdbserver/workloads/ReadWrite.cpp"
+      - "fdbserver/workloads/ReadWriteWorkload.h"
+      - "fdbserver/workloads/RandomClogging.cpp"
+      - "fdbserver/workloads/DiskFailureInjection.cpp"
+permissions:
+  contents: read
+  actions: read
+
+concurrency:
+  group: ratekeeper-benchmarks-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  benchmark:
+    name: Baseline and partial-failure simulations
+    runs-on: ubuntu-latest
+
+    env:
+      BUILD_TYPE: Release
+      PROFILE: ${{ github.event_name == 'pull_request' && 'paper' || inputs.profile || 'smoke' }}
+      SEEDS: ${{ github.event_name == 'pull_request' && '101 202 303 404 505 606 707 808 909 1010 1111 1212 1313 1414 1515 1616 1717 1818 1919 2020 2121 2222 2323 2424 2525 2626 2727 2828 2929 3030' || inputs.seeds || (inputs.profile == 'paper' && '101 202 303 404 505 606 707 808 909 1010' || '101 202 303') }}
+      BUILD_JOBS: ${{ inputs.build_jobs || '2' }}
+      CCACHE_DIR: ${{ github.workspace }}/.ccache
+      CCACHE_MAXSIZE: 2G
+      # PR #2 timed out after preserving 87 complete runs. Resume that artifact
+      # only for this research PR; other PRs start from an empty result set.
+      RESUME_RUN_ID: ${{ inputs.resume_run_id || (github.event_name == 'pull_request' && github.event.pull_request.number == 2 && '39149936910') || '' }}
+      RESUME_RUN_ATTEMPT: ${{ inputs.resume_run_attempt || '1' }}
+
+    steps:
+      - name: Free disk space
+        run: |
+          set -euo pipefail
+          df -h
+          sudo rm -rf /usr/share/dotnet
+          sudo rm -rf /usr/local/lib/android
+          sudo rm -rf /opt/ghc
+          sudo rm -rf /opt/hostedtoolcache
+          sudo docker image prune --all --force || true
+          df -h
+
+      - name: Checkout source
+        uses: actions/checkout@v4
+
+      - name: Validate inputs
+        run: |
+          set -euo pipefail
+          [[ "$BUILD_JOBS" =~ ^[12]$ ]] || {
+            echo "build_jobs must be 1 or 2" >&2
+            exit 2
+          }
+          for seed in $SEEDS; do
+            [[ "$seed" =~ ^[0-9]+$ ]] || {
+              echo "Invalid seed: $seed" >&2
+              exit 2
+            }
+          done
+
+      - name: Prepare directories
+        run: mkdir -p build .ccache benchmark-results
+
+      - name: Restore completed benchmark seeds
+        if: env.RESUME_RUN_ID != ''
+        uses: actions/download-artifact@v4
+        with:
+          name: ratekeeper-benchmarks-${{ env.RESUME_RUN_ID }}-${{ env.RESUME_RUN_ATTEMPT }}
+          path: benchmark-results
+          repository: ${{ github.repository }}
+          run-id: ${{ env.RESUME_RUN_ID }}
+          github-token: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Validate restored benchmark checkpoint
+        if: env.RESUME_RUN_ID != ''
+        run: |
+          set -euo pipefail
+          test -f benchmark-results/manifest.json
+          python3 - <<'PY'
+          import json
+          import os
+          from pathlib import Path
+
+          path = Path("benchmark-results/manifest.json")
+          manifest = json.loads(path.read_text())
+          expected_run = os.environ["RESUME_RUN_ID"]
+          if manifest.get("workflow_run_id") != expected_run:
+              raise SystemExit(
+                  f"Checkpoint run mismatch: expected {expected_run}, "
+                  f"found {manifest.get('workflow_run_id')}"
+              )
+          expected_seeds = [int(seed) for seed in os.environ["SEEDS"].split()]
+          if manifest.get("seeds") != expected_seeds:
+              raise SystemExit("Checkpoint seed list does not match this run")
+          destination = Path(f"benchmark-results/prior-manifest-{expected_run}.json")
+          destination.write_text(json.dumps(manifest, indent=2) + "\n")
+          print(f"Restored checkpoint from workflow run {expected_run}")
+          PY
+
+      - name: Restore ccache
+        id: ccache-restore
+        uses: actions/cache/restore@v4
+        with:
+          path: .ccache
+          key: fdb-ccache-${{ runner.os }}-${{ env.BUILD_TYPE }}-${{ github.run_id }}-${{ github.run_attempt }}
+          restore-keys: |
+            fdb-ccache-${{ runner.os }}-${{ env.BUILD_TYPE }}-
+            fdb-ccache-${{ runner.os }}-
+
+      - name: Build fdbserver from checked-out source
+        run: |
+          set -euo pipefail
+          docker run --rm \
+            -v "${{ github.workspace }}:/workspace" \
+            -v "${{ github.workspace }}/.ccache:/root/.ccache" \
+            -e BUILD_TYPE="$BUILD_TYPE" \
+            -e BUILD_JOBS="$BUILD_JOBS" \
+            -e CCACHE_DIR=/root/.ccache \
+            -e CCACHE_MAXSIZE=2G \
+            -e CCACHE_BASEDIR=/workspace \
+            -e CCACHE_NOHASHDIR=true \
+            -e GOFLAGS=-buildvcs=false \
+            -w /workspace/build \
+            docker.io/foundationdb/build:rockylinux9-latest \
+            bash -euo pipefail -c '
+              source /opt/rh/gcc-toolset-13/enable || true
+              git config --global --add safe.directory /workspace
+
+              cmake -G Ninja \
+                -D CMAKE_BUILD_TYPE="$BUILD_TYPE" \
+                -D BUILD_SWIFT_BINDING=OFF \
+                -D BUILD_TESTING=OFF \
+                -D ENABLE_UNIT_TESTS=OFF \
+                -D USE_CCACHE=ON \
+                -D USE_LD=LLD \
+                -D USE_LIBCXX=1 \
+                -D USE_WERROR=OFF \
+                ..
+
+              ninja -j"$BUILD_JOBS" fdbserver
+              test -x bin/fdbserver
+              bin/fdbserver --version
+              ccache --show-stats || true
+            '
+
+      - name: Record reproducibility manifest
+        run: |
+          set -euo pipefail
+          image_id=$(docker image inspect --format '{{.Id}}' docker.io/foundationdb/build:rockylinux9-latest)
+          binary_sha=$(sha256sum build/bin/fdbserver | cut -d' ' -f1)
+          binary_version=$(build/bin/fdbserver --version | tr '\n' ' ')
+          scenario_sha=$(find contrib/ratekeeper_benchmarks/scenarios -name '*.toml' -type f -print0 | sort -z | xargs -0 sha256sum)
+          instrumentation_sha=$(sha256sum fdbserver/workloads/RandomClogging.cpp)
+          python3 - "$image_id" "$binary_sha" "$binary_version" "$scenario_sha" "$instrumentation_sha" <<'PY'
+          import json, os, platform, sys
+          manifest = {
+              "git_commit": os.environ["GITHUB_SHA"],
+              "git_ref": os.environ["GITHUB_REF"],
+              "workflow_run_id": os.environ["GITHUB_RUN_ID"],
+              "workflow_run_attempt": os.environ["GITHUB_RUN_ATTEMPT"],
+              "resumed_from_workflow_run_id": os.environ.get("RESUME_RUN_ID") or None,
+              "resumed_from_workflow_run_attempt": (
+                  os.environ.get("RESUME_RUN_ATTEMPT")
+                  if os.environ.get("RESUME_RUN_ID")
+                  else None
+              ),
+              "profile": os.environ["PROFILE"],
+              "seeds": [int(seed) for seed in os.environ["SEEDS"].split()],
+              "build_type": os.environ["BUILD_TYPE"],
+              "build_image_id": sys.argv[1],
+              "fdbserver_sha256": sys.argv[2],
+              "fdbserver_version": sys.argv[3].strip(),
+              "scenario_sha256": sys.argv[4].splitlines(),
+              "instrumentation_source_sha256": sys.argv[5],
+              "runner_platform": platform.platform(),
+          }
+          with open("benchmark-results/manifest.json", "w") as handle:
+              json.dump(manifest, handle, indent=2)
+              handle.write("\n")
+          PY
+
+      - name: Prepare ccache for upload
+        if: always()
+        run: |
+          sudo chown -R "$(id -u):$(id -g)" .ccache || true
+          du -sh .ccache || true
+
+      - name: Save ccache
+        if: always()
+        uses: actions/cache/save@v4
+        with:
+          path: .ccache
+          key: fdb-ccache-${{ runner.os }}-${{ env.BUILD_TYPE }}-${{ github.run_id }}-${{ github.run_attempt }}
+
+      - name: Run deterministic benchmark scenarios
+        id: simulations
+        run: |
+          set -uo pipefail
+
+          scenarios=(
+            baseline
+            network_clog_mild
+            network_clog_severe
+            slow_storage
+          )
+
+          result=0
+          for scenario in "${scenarios[@]}"; do
+            test_file="contrib/ratekeeper_benchmarks/scenarios/${scenario}.toml"
+            test -f "$test_file" || {
+              echo "Missing benchmark definition: $test_file" >&2
+              exit 2
+            }
+
+            for seed in $SEEDS; do
+              host_run_dir="${{ github.workspace }}/benchmark-results/${scenario}/seed-${seed}"
+              container_run_dir="/workspace/benchmark-results/${scenario}/seed-${seed}"
+              mkdir -p "$host_run_dir"
+
+              if [[ -f "$host_run_dir/status.txt" ]] &&
+                 [[ "$(<"$host_run_dir/status.txt")" == "PASS" ]]; then
+                echo "SKIP ${scenario} seed=${seed}: restored PASS result"
+                continue
+              fi
+
+              # Remove a partial checkpoint before rerunning that exact seed.
+              find "$host_run_dir" -mindepth 1 -delete
+
+              echo "::group::${scenario} seed=${seed}"
+              if docker run --rm \
+                -v "${{ github.workspace }}:/workspace" \
+                -w "$container_run_dir" \
+                docker.io/foundationdb/build:rockylinux9-latest \
+                bash -euo pipefail -c \
+                  "/workspace/build/bin/fdbserver -r simulation -f /workspace/$test_file --seed $seed --buggify off 2>&1 | tee simulation.log"; then
+                echo "PASS" > "$host_run_dir/status.txt"
+              else
+                status=$?
+                echo "FAIL ($status)" > "$host_run_dir/status.txt"
+                result=1
+              fi
+              echo "::endgroup::"
+            done
+          done
+
+          exit "$result"
+
+      - name: Parse benchmark evidence
+        if: always()
+        run: |
+          set -euo pipefail
+          expected_seeds=$(wc -w <<< "$SEEDS" | tr -d ' ')
+          python3 contrib/ratekeeper_benchmarks/parse_results.py \
+            --results benchmark-results \
+            --output benchmark-results/summary \
+            --expected-seeds "$expected_seeds" \
+            --strict
+
+          cat benchmark-results/summary/evidence.md >> "$GITHUB_STEP_SUMMARY"
+          cat benchmark-results/summary/validity.md >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Prepare benchmark artifacts
+        if: always()
+        run: |
+          set -euo pipefail
+          sudo chown -R "$(id -u):$(id -g)" benchmark-results
+
+      - name: Upload raw traces and benchmark summaries
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: ratekeeper-benchmarks-${{ github.run_id }}-${{ github.run_attempt }}
+          path: |
+            benchmark-results/**/simulation.log
+            benchmark-results/**/status.txt
+            benchmark-results/**/trace.*.xml
+            benchmark-results/**/trace.*.json
+            benchmark-results/*.json
+            benchmark-results/summary/**
+          if-no-files-found: error
+          retention-days: ${{ env.PROFILE == 'paper' && 90 || 30 }}
+
