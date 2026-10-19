@@ -271,6 +271,66 @@ jobs:
           done
           exit "$result"
 
+      - name: Compact traces for artifact upload
+        if: always()
+        env:
+          SCENARIO: ${{ matrix.scenario }}
+        run: |
+          set -euo pipefail
+          python3 - <<'PY'
+          import os
+          import re
+          from pathlib import Path
+          
+          scenario_dir = Path("benchmark-results") / os.environ["SCENARIO"]
+          if not scenario_dir.exists():
+              print(f"No results for {os.environ['SCENARIO']}; skipping trace compaction.")
+              raise SystemExit(0)
+          
+          keep_exact = {
+              "TestStarting",
+              "ReadWrite_CommitLatency",
+              "CloggingPair",
+              "SetDiskFailure",
+              "AddFailureInjectionWorkload",
+          }
+          type_re = re.compile(r'Type="([^"]+)"')
+          
+          files_compacted = 0
+          lines_before = 0
+          lines_after = 0
+          
+          for trace_path in scenario_dir.glob("seed-*/trace.*.xml"):
+              temp_path = trace_path.with_suffix(".xml.filtered")
+              kept_lines = 0
+              with (
+                  trace_path.open("r", errors="replace") as source,
+                  temp_path.open("w") as target,
+              ):
+                  for line in source:
+                      lines_before += 1
+                      match = type_re.search(line)
+                      if not match:
+                          continue
+                      event_type = match.group(1)
+                      if (
+                          event_type in keep_exact
+                          or event_type.startswith("RkUpdate")
+                          or event_type.endswith("_TotalLatency")
+                      ):
+                          target.write(line)
+                          kept_lines += 1
+              temp_path.replace(trace_path)
+              lines_after += kept_lines
+              files_compacted += 1
+          
+          print(
+              "Compacted "
+              f"{files_compacted} trace files for {os.environ['SCENARIO']} "
+              f"({lines_before} lines -> {lines_after} lines)."
+          )
+          PY
+
       - name: Package scenario artifacts
         if: always()
         env:
