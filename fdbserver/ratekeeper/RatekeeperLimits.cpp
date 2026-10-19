@@ -38,5 +38,5 @@ RatekeeperLimits::RatekeeperLimits(TransactionPriority priority,
                                                                                    // are expected to not
     // be durable on the storage servers
     lastDurabilityLag(0), durabilityLagLimit(std::numeric_limits<double>::infinity()),
-    latencyLimit(std::numeric_limits<double>::infinity()), priority(priority),
-    context(context), rkUpdateEventCacheHolder(makeReference<EventCacheHolder>("RkUpdate" + context)) {}
+    latencyLimit(std::numeric_limits<double>::infinity()), priority(priority), context(context),
+    rkUpdateEventCacheHolder(makeReference<EventCacheHolder>("RkUpdate" + context)) {}

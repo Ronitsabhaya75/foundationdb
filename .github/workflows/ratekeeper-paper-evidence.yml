@@ -52,13 +52,6 @@ jobs:
       - name: Checkout source
         uses: actions/checkout@v4
 
-      - name: Apply delayed-fault research instrumentation
-        run: |
-          set -euo pipefail
-          patch_file=contrib/ratekeeper_benchmarks/patches/random-clogging-start-delay.patch
-          git apply --check "$patch_file"
-          git apply "$patch_file"
-
       - name: Validate seed list
         run: |
           set -euo pipefail
@@ -136,8 +129,8 @@ jobs:
           binary_sha=$(sha256sum build/bin/fdbserver | cut -d' ' -f1)
           binary_version=$(build/bin/fdbserver --version | tr '\n' ' ')
           scenario_sha=$(find contrib/ratekeeper_benchmarks/scenarios -name '*.toml' -type f -print0 | sort -z | xargs -0 sha256sum)
-          patch_sha=$(sha256sum contrib/ratekeeper_benchmarks/patches/random-clogging-start-delay.patch)
-          python3 - "$binary_sha" "$binary_version" "$scenario_sha" "$patch_sha" <<'PY'
+          instrumentation_sha=$(sha256sum fdbserver/workloads/RandomClogging.cpp)
+          python3 - "$binary_sha" "$binary_version" "$scenario_sha" "$instrumentation_sha" <<'PY'
           import json, os, platform, sys
           manifest = {
               "git_commit": os.environ["GITHUB_SHA"],
@@ -151,7 +144,7 @@ jobs:
               "fdbserver_sha256": sys.argv[1],
               "fdbserver_version": sys.argv[2].strip(),
               "scenario_sha256": sys.argv[3].splitlines(),
-              "instrumentation_patch_sha256": sys.argv[4],
+              "instrumentation_source_sha256": sys.argv[4],
               "runner_platform": platform.platform(),
           }
           with open("paper-build/manifest.json", "w") as handle:
@@ -213,7 +206,8 @@ jobs:
       - name: Restore executable
         run: |
           set -euo pipefail
-          tar -xzf paper-build/fdbserver.tar.gz
+          mkdir -p build
+          tar -xzf paper-build/fdbserver.tar.gz -C build
           chmod +x build/bin/fdbserver
           test -x build/bin/fdbserver
 

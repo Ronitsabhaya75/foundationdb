@@ -226,7 +226,8 @@ jobs:
       - name: Restore executable
         run: |
           set -euo pipefail
-          tar -xzf sim-build/fdbserver.tar.gz
+          mkdir -p build
+          tar -xzf sim-build/fdbserver.tar.gz -C build
           chmod +x build/bin/fdbserver
           test -x build/bin/fdbserver
 
@@ -277,7 +278,7 @@ jobs:
         run: |
           set -euo pipefail
           sudo chown -R "$(id -u):$(id -g)" benchmark-results || true
-          mkdir -p scenario-archive
+          mkdir -p "benchmark-results/${SCENARIO}" scenario-archive
           tar -C benchmark-results -czf "scenario-archive/${SCENARIO}.tar.gz" "$SCENARIO"
 
       - name: Upload scenario raw evidence

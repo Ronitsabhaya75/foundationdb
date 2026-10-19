@@ -1,6 +1,6 @@
 # Ratekeeper partial-failure benchmark
 
-This suite is the reproducible baseline for research on latency-aware overload control in FoundationDB. It builds `fdbserver` from the checked-out commit and applies the versioned `patches/random-clogging-start-delay.patch` test-instrumentation patch so network experiments contain healthy, fault, and recovery phases.
+This suite is the reproducible baseline for research on latency-aware overload control in FoundationDB. It builds `fdbserver` from the checked-out commit. The delayed-fault instrumentation is part of `fdbserver/workloads/RandomClogging.cpp`, so network experiments contain healthy, fault, and recovery phases without modifying the checkout during CI.
 
 The smoke workflow runs the same ReadWrite workload and deterministic seeds under four conditions:
 
