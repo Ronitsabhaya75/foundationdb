@@ -1,9 +1,10 @@
 name: Ratekeeper Simulation Benchmarks (120 Simulations)
 
 on:
-  push:
+  pull_request:
     branches:
-      - "research/ratekeeper-fdb"
+      - "main"
+  workflow_dispatch:
     inputs:
       simulation_scale:
         description: "Simulation scale / seed count"
@@ -52,7 +53,6 @@ jobs:
   build:
     name: Build fdbserver binary
     runs-on: ubuntu-latest
-    timeout-minutes: 300
     outputs:
       build_image: ${{ steps.image.outputs.ref }}
       seeds: ${{ steps.seeds.outputs.seeds }}
@@ -73,7 +73,7 @@ jobs:
         id: seeds
         run: |
           set -euo pipefail
-          scale="${{ inputs.simulation_scale }}"
+          scale="${{ inputs.simulation_scale || '120 total simulations (30 seeds x 4 scenarios)' }}"
           if [[ "$scale" == "120 total simulations (30 seeds x 4 scenarios)" ]]; then
             # 30 deterministic paired seeds across 4 scenarios = 120 simulations
             seed_list="101 202 303 404 505 606 707 808 909 1010 1111 1212 1313 1414 1515 1616 1717 1818 1919 2020 2121 2222 2323 2424 2525 2626 2727 2828 2929 3030"
@@ -107,7 +107,7 @@ jobs:
 
       - name: Build fdbserver from checked-out source
         env:
-          BUILD_JOBS: ${{ inputs.build_jobs }}
+          BUILD_JOBS: ${{ inputs.build_jobs || '2' }}
         run: |
           set -euo pipefail
           docker run --rm \
@@ -203,7 +203,6 @@ jobs:
     name: ${{ matrix.scenario }}
     needs: build
     runs-on: ubuntu-latest
-    timeout-minutes: 240
     strategy:
       fail-fast: false
       max-parallel: 4
@@ -236,8 +235,8 @@ jobs:
           BUILD_IMAGE: ${{ needs.build.outputs.build_image }}
           SCENARIO: ${{ matrix.scenario }}
           SEEDS: ${{ needs.build.outputs.seeds }}
-          ENABLE_LATENCY_CTRL: ${{ inputs.enable_latency_controller }}
-          TARGET_GRV_LATENCY: ${{ inputs.target_grv_latency }}
+          ENABLE_LATENCY_CTRL: ${{ inputs.enable_latency_controller != false }}
+          TARGET_GRV_LATENCY: ${{ inputs.target_grv_latency || '0.020' }}
         run: |
           set -uo pipefail
           test_file="contrib/ratekeeper_benchmarks/scenarios/${SCENARIO}.toml"
@@ -297,7 +296,6 @@ jobs:
       - build
       - simulate
     runs-on: ubuntu-latest
-    timeout-minutes: 30
 
     steps:
       - name: Checkout code

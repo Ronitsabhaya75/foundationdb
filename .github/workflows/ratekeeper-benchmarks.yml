@@ -52,7 +52,6 @@ jobs:
   benchmark:
     name: Baseline and partial-failure simulations
     runs-on: ubuntu-latest
-    timeout-minutes: 300
 
     env:
       BUILD_TYPE: Release

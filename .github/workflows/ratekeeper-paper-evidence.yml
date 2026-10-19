@@ -38,7 +38,6 @@ jobs:
   build:
     name: Build source once
     runs-on: ubuntu-latest
-    timeout-minutes: 300
     outputs:
       build_image: ${{ steps.image.outputs.ref }}
 
